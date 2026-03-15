@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Конфигурация бота
-BOT_TOKEN = "8720303138:AAFZG7Wm68hXFVTVhcTbKX6lx8s6xf2Uiy0"  # Замените на ваш токен
+BOT_TOKEN = "8013481108:AAF9M8datq8zbDBoY6WnPfsUCas1I11G404"  # Замените на ваш токен
 ADMIN_IDS = [5356400377]  # Замените на ваш Telegram ID
 
 # Инициализация бота и диспетчера
