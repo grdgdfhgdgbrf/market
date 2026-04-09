@@ -24,8 +24,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Конфигурация бота
-BOT_TOKEN = "8720303138:AAFZG7Wm68hXFVTVhcTbKX6lx8s6xf2Uiy0"  # Замените на ваш токен
-ADMIN_IDS = [5356400377]  # Замените на ваш Telegram ID
+BOT_TOKEN = "8720303138:AAFZG7Wm68hXFVTVhcTbKX6lx8s6xf2Uiy0"
+ADMIN_IDS = [5356400377]
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
@@ -45,6 +45,11 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"
     COMPLETED = "completed"
 
+class ContestStatus(Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    ENDED = "ended"
+
 class Product:
     def __init__(self, id: str, name: str, description: str, price_rub: float, price_stars: float, stock: int = 999):
         self.id = id
@@ -63,6 +68,33 @@ class Promotion:
         self.max_uses = max_uses
         self.used_count = 0
         self.is_active = True
+
+class Contest:
+    def __init__(self, id: str, name: str, description: str, prize: str, 
+                 required_purchase: bool = False, required_product_id: str = None,
+                 start_date: datetime = None, end_date: datetime = None):
+        self.id = id
+        self.name = name
+        self.description = description
+        self.prize = prize
+        self.required_purchase = required_purchase
+        self.required_product_id = required_product_id
+        self.start_date = start_date or datetime.now()
+        self.end_date = end_date or (datetime.now() + timedelta(days=7))
+        self.status = ContestStatus.ACTIVE
+        self.participants = []  # list of user_ids
+        self.winners = []
+        self.created_at = datetime.now()
+    
+    def is_active(self) -> bool:
+        return self.status == ContestStatus.ACTIVE and datetime.now() < self.end_date
+    
+    def add_participant(self, user_id: int):
+        if user_id not in self.participants:
+            self.participants.append(user_id)
+    
+    def has_participated(self, user_id: int) -> bool:
+        return user_id in self.participants
 
 class Order:
     def __init__(self, order_id: str, user_id: int, username: str, items: Dict[str, int], 
@@ -134,6 +166,7 @@ class Database:
         self.promocodes = {}
         self.support_tickets = {}
         self.reviews = []
+        self.contests = {}
         self.payment_details = {
             "card": "2200 0000 0000 0000",
             "phone": "+7 (999) 999-99-99",
@@ -142,6 +175,7 @@ class Database:
         self.next_product_id = 1
         self.next_ticket_id = 1
         self.next_review_id = 1
+        self.next_contest_id = 1
         self.reviews_group_id = None
         self.bot_username = "ShopBot"
 
@@ -378,6 +412,73 @@ class Database:
     def get_payment_details(self) -> dict:
         return self.payment_details.copy()
 
+    # Методы для конкурсов
+    def add_contest(self, name: str, description: str, prize: str, 
+                    required_purchase: bool = False, required_product_id: str = None,
+                    days_valid: int = 7) -> Contest:
+        contest_id = str(self.next_contest_id)
+        self.next_contest_id += 1
+        end_date = datetime.now() + timedelta(days=days_valid)
+        contest = Contest(contest_id, name, description, prize, 
+                         required_purchase, required_product_id,
+                         datetime.now(), end_date)
+        self.contests[contest_id] = contest
+        return contest
+
+    def get_contest(self, contest_id: str) -> Optional[Contest]:
+        return self.contests.get(contest_id)
+
+    def get_active_contests(self) -> List[Contest]:
+        return [c for c in self.contests.values() if c.is_active()]
+
+    def get_all_contests(self) -> List[Contest]:
+        return list(self.contests.values())
+
+    def update_contest(self, contest_id: str, **kwargs) -> bool:
+        if contest_id in self.contests:
+            contest = self.contests[contest_id]
+            for key, value in kwargs.items():
+                if hasattr(contest, key):
+                    setattr(contest, key, value)
+            return True
+        return False
+
+    def delete_contest(self, contest_id: str) -> bool:
+        if contest_id in self.contests:
+            del self.contests[contest_id]
+            return True
+        return False
+
+    def participate_in_contest(self, contest_id: str, user_id: int) -> bool:
+        contest = self.get_contest(contest_id)
+        if contest and contest.is_active():
+            contest.add_participant(user_id)
+            return True
+        return False
+
+    def has_participated_in_contest(self, contest_id: str, user_id: int) -> bool:
+        contest = self.get_contest(contest_id)
+        if contest:
+            return contest.has_participated(user_id)
+        return False
+
+    def check_purchase_requirement(self, contest_id: str, user_id: int) -> bool:
+        contest = self.get_contest(contest_id)
+        if not contest or not contest.required_purchase:
+            return True
+        
+        if not contest.required_product_id:
+            return True
+        
+        # Проверяем, покупал ли пользователь нужный товар
+        user_orders = self.get_user_orders(user_id)
+        for order in user_orders:
+            if order.status == OrderStatus.COMPLETED:
+                for product_id in order.items:
+                    if product_id == contest.required_product_id:
+                        return True
+        return False
+
 db = Database()
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -387,7 +488,8 @@ def get_main_keyboard(is_admin: bool = False):
         [KeyboardButton(text="🛍 Каталог")],
         [KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="📦 Мои заказы")],
         [KeyboardButton(text="ℹ️ Поддержка"), KeyboardButton(text="📝 Промокод")],
-        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="🧾 Чеки")]
+        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="🧾 Чеки")],
+        [KeyboardButton(text="🎁 Конкурсы")]
     ]
     
     if is_admin:
@@ -403,7 +505,7 @@ def get_admin_keyboard():
         [KeyboardButton(text="🔄 Активные заказы"), KeyboardButton(text="✅ Завершенные заказы")],
         [KeyboardButton(text="🎫 Создать промокод"), KeyboardButton(text="💳 Реквизиты оплаты")],
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📨 Ответы поддержки")],
-        [KeyboardButton(text="⭐ Управление отзывами"), KeyboardButton(text="⚙️ Настройки группы")],
+        [KeyboardButton(text="⭐ Управление отзывами"), KeyboardButton(text="🎁 Управление конкурсами")],
         [KeyboardButton(text="👤 Установить имя"), KeyboardButton(text="🔙 На главную")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -412,10 +514,6 @@ def get_cancel_inline_keyboard():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
     return builder.as_markup()
-
-def get_cancel_reply_keyboard():
-    buttons = [[KeyboardButton(text="❌ Отмена")]]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def get_reviews_keyboard():
     buttons = [
@@ -639,6 +737,38 @@ def get_manual_quantity_inline_keyboard(product_id: str):
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_manual_qty_{product_id}"))
     return builder.as_markup()
 
+def get_contests_inline_keyboard():
+    contests = db.get_active_contests()
+    
+    builder = InlineKeyboardBuilder()
+    
+    for contest in contests:
+        builder.row(InlineKeyboardButton(
+            text=f"🎁 {contest.name}",
+            callback_data=f"contest_{contest.id}"
+        ))
+    
+    builder.row(InlineKeyboardButton(text="◀️ На главную", callback_data="back_to_main"))
+    
+    return builder.as_markup()
+
+def get_admin_contests_inline_keyboard():
+    contests = db.get_all_contests()
+    
+    builder = InlineKeyboardBuilder()
+    
+    for contest in contests:
+        status = "🟢" if contest.is_active() else "🔴"
+        builder.row(InlineKeyboardButton(
+            text=f"{status} {contest.name}",
+            callback_data=f"admin_contest_{contest.id}"
+        ))
+    
+    builder.row(InlineKeyboardButton(text="➕ Создать конкурс", callback_data="create_contest"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_admin"))
+    
+    return builder.as_markup()
+
 # ==================== СОСТОЯНИЯ FSM ====================
 
 class AdminStates(StatesGroup):
@@ -663,6 +793,12 @@ class AdminStates(StatesGroup):
     waiting_for_review_reply = State()
     waiting_for_group_setup = State()
     waiting_for_bot_username = State()
+    waiting_for_contest_name = State()
+    waiting_for_contest_description = State()
+    waiting_for_contest_prize = State()
+    waiting_for_contest_days = State()
+    waiting_for_contest_required_purchase = State()
+    waiting_for_contest_required_product = State()
 
 class UserStates(StatesGroup):
     waiting_for_promocode = State()
@@ -981,7 +1117,10 @@ async def support_request(message: Message, state: FSMContext):
     await message.answer(
         "📝 Опишите вашу проблему или вопрос. Напишите сообщение, и мы ответим вам в ближайшее время.\n\n"
         "Вы также можете прикрепить фото или документ, если это необходимо.",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
 
 @dp.message(UserStates.waiting_for_support_message)
@@ -1034,7 +1173,10 @@ async def enter_promocode(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_for_promocode)
     await message.answer(
         "Введите промокод:",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
 
 @dp.message(UserStates.waiting_for_promocode)
@@ -1143,6 +1285,435 @@ async def show_receipt(callback: CallbackQuery):
             caption="📸 Ваш скриншот оплаты (копия)"
         )
     
+    await callback.answer()
+
+# ==================== КОНКУРСЫ ====================
+
+@dp.message(F.text == "🎁 Конкурсы")
+async def show_contests(message: Message):
+    if is_group_chat(message):
+        return
+    
+    active_contests = db.get_active_contests()
+    
+    if not active_contests:
+        await message.answer(
+            "🎁 На данный момент нет активных конкурсов.\n"
+            "Следите за обновлениями!"
+        )
+        return
+    
+    await message.answer(
+        "🎁 *Активные конкурсы*\n\n"
+        "Выберите конкурс для участия:",
+        parse_mode="Markdown",
+        reply_markup=get_contests_inline_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("contest_"))
+async def view_contest(callback: CallbackQuery):
+    contest_id = callback.data.split("_")[1]
+    contest = db.get_contest(contest_id)
+    
+    if not contest or not contest.is_active():
+        await callback.answer("Конкурс не найден или уже завершен", show_alert=True)
+        return
+    
+    # Проверяем требование покупки
+    if contest.required_purchase:
+        has_purchased = db.check_purchase_requirement(contest_id, callback.from_user.id)
+        if not has_purchased:
+            product = db.get_product(contest.required_product_id) if contest.required_product_id else None
+            product_text = f"товар \"{product.name}\"" if product else "необходимый товар"
+            
+            await callback.message.answer(
+                f"❌ Для участия в этом конкурсе необходимо приобрести {product_text}.\n\n"
+                f"После покупки вы сможете участвовать в конкурсе автоматически.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🛍 Перейти в каталог", callback_data="back_to_catalog")],
+                        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_contests")]
+                    ]
+                )
+            )
+            await callback.answer()
+            return
+    
+    # Проверяем, участвовал ли уже пользователь
+    has_participated = db.has_participated_in_contest(contest_id, callback.from_user.id)
+    
+    end_date = contest.end_date.strftime('%d.%m.%Y %H:%M')
+    remaining = contest.end_date - datetime.now()
+    days = remaining.days
+    hours = remaining.seconds // 3600
+    
+    contest_text = (
+        f"🎁 *{contest.name}*\n\n"
+        f"{contest.description}\n\n"
+        f"🏆 *Приз:* {contest.prize}\n"
+        f"📅 *Окончание:* {end_date}\n"
+        f"⏰ *Осталось:* {days} д. {hours} ч.\n"
+        f"👥 *Участников:* {len(contest.participants)}\n"
+    )
+    
+    if contest.required_purchase:
+        product = db.get_product(contest.required_product_id) if contest.required_product_id else None
+        if product:
+            contest_text += f"📦 *Требуется покупка:* {product.name}\n"
+    
+    keyboard = InlineKeyboardBuilder()
+    
+    if has_participated:
+        keyboard.row(InlineKeyboardButton(text="✅ Вы уже участвуете", callback_data="noop"))
+    else:
+        keyboard.row(InlineKeyboardButton(text="🎲 Участвовать", callback_data=f"participate_{contest_id}"))
+    
+    keyboard.row(InlineKeyboardButton(text="◀️ Назад к конкурсам", callback_data="back_to_contests"))
+    
+    await callback.message.edit_text(
+        contest_text,
+        parse_mode="Markdown",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("participate_"))
+async def participate_in_contest(callback: CallbackQuery):
+    contest_id = callback.data.split("_")[1]
+    contest = db.get_contest(contest_id)
+    
+    if not contest or not contest.is_active():
+        await callback.answer("Конкурс не найден или уже завершен", show_alert=True)
+        return
+    
+    # Проверяем требование покупки
+    if contest.required_purchase:
+        has_purchased = db.check_purchase_requirement(contest_id, callback.from_user.id)
+        if not has_purchased:
+            product = db.get_product(contest.required_product_id) if contest.required_product_id else None
+            product_text = f"товар \"{product.name}\"" if product else "необходимый товар"
+            
+            await callback.answer(f"Для участия необходимо приобрести {product_text}", show_alert=True)
+            return
+    
+    if db.has_participated_in_contest(contest_id, callback.from_user.id):
+        await callback.answer("Вы уже участвуете в этом конкурсе!", show_alert=True)
+        return
+    
+    db.participate_in_contest(contest_id, callback.from_user.id)
+    
+    await callback.answer("✅ Вы успешно участвуете в конкурсе! Удачи!", show_alert=True)
+    
+    # Обновляем сообщение
+    await view_contest(callback)
+
+@dp.callback_query(F.data == "back_to_contests")
+async def back_to_contests(callback: CallbackQuery):
+    active_contests = db.get_active_contests()
+    
+    if not active_contests:
+        await callback.message.edit_text(
+            "🎁 На данный момент нет активных конкурсов.\n"
+            "Следите за обновлениями!"
+        )
+    else:
+        await callback.message.edit_text(
+            "🎁 *Активные конкурсы*\n\n"
+            "Выберите конкурс для участия:",
+            parse_mode="Markdown",
+            reply_markup=get_contests_inline_keyboard()
+        )
+    await callback.answer()
+
+# ==================== АДМИН-ПАНЕЛЬ КОНКУРСОВ ====================
+
+@dp.message(F.text == "🎁 Управление конкурсами")
+async def manage_contests(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    await message.answer(
+        "🎁 *Управление конкурсами*\n\n"
+        "Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_contests_inline_keyboard()
+    )
+
+@dp.callback_query(F.data == "create_contest")
+async def create_contest_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав")
+        return
+    
+    await state.set_state(AdminStates.waiting_for_contest_name)
+    await message.answer(
+        "Введите название конкурса:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_contest_name)
+async def create_contest_name(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(contest_name=message.text)
+    await state.set_state(AdminStates.waiting_for_contest_description)
+    await message.answer(
+        "Введите описание конкурса:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_contest_description)
+async def create_contest_description(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(contest_description=message.text)
+    await state.set_state(AdminStates.waiting_for_contest_prize)
+    await message.answer(
+        "Введите приз конкурса:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_contest_prize)
+async def create_contest_prize(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(contest_prize=message.text)
+    await state.set_state(AdminStates.waiting_for_contest_days)
+    await message.answer(
+        "Введите количество дней действия конкурса:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_contest_days)
+async def create_contest_days(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        days = int(message.text)
+        if days < 1:
+            raise ValueError
+        
+        await state.update_data(contest_days=days)
+        await state.set_state(AdminStates.waiting_for_contest_required_purchase)
+        
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data="req_purchase_yes")],
+                [InlineKeyboardButton(text="❌ Нет", callback_data="req_purchase_no")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
+        )
+        
+        await message.answer(
+            "Требуется ли обязательная покупка для участия?",
+            reply_markup=keyboard
+        )
+    except ValueError:
+        await message.answer("❌ Введите корректное число дней")
+
+@dp.callback_query(F.data.startswith("req_purchase_"))
+async def create_contest_required_purchase(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав")
+        return
+    
+    required = callback.data == "req_purchase_yes"
+    await state.update_data(contest_required_purchase=required)
+    
+    if required:
+        await state.set_state(AdminStates.waiting_for_contest_required_product)
+        
+        products = db.get_all_products()
+        if not products:
+            await callback.message.answer(
+                "❌ Нет доступных товаров. Сначала добавьте товары.",
+                reply_markup=get_admin_keyboard()
+            )
+            await state.clear()
+            await callback.answer()
+            return
+        
+        builder = InlineKeyboardBuilder()
+        for product in products:
+            builder.row(InlineKeyboardButton(
+                text=f"{product.name} - {product.price_rub}₽",
+                callback_data=f"req_product_{product.id}"
+            ))
+        builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+        
+        await callback.message.edit_text(
+            "Выберите товар, который нужно купить для участия:",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        contest = db.add_contest(
+            (await state.get_data())['contest_name'],
+            (await state.get_data())['contest_description'],
+            (await state.get_data())['contest_prize'],
+            False,
+            None,
+            (await state.get_data())['contest_days']
+        )
+        
+        await callback.message.edit_text(
+            f"✅ Конкурс \"{contest.name}\" успешно создан!\n\n"
+            f"📅 Длительность: {contest.end_date.strftime('%d.%m.%Y')}\n"
+            f"🏆 Приз: {contest.prize}\n"
+            f"🎲 Участники смогут участвовать сразу."
+        )
+        await state.clear()
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("req_product_"))
+async def create_contest_required_product(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав")
+        return
+    
+    product_id = callback.data.split("_")[2]
+    data = await state.get_data()
+    
+    contest = db.add_contest(
+        data['contest_name'],
+        data['contest_description'],
+        data['contest_prize'],
+        True,
+        product_id,
+        data['contest_days']
+    )
+    
+    product = db.get_product(product_id)
+    
+    await callback.message.edit_text(
+        f"✅ Конкурс \"{contest.name}\" успешно создан!\n\n"
+        f"📅 Длительность: {contest.end_date.strftime('%d.%m.%Y')}\n"
+        f"🏆 Приз: {contest.prize}\n"
+        f"📦 Требуется покупка: {product.name if product else 'Неизвестный товар'}\n\n"
+        f"Пользователи смогут участвовать только после покупки этого товара."
+    )
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_contest_"))
+async def admin_view_contest(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав")
+        return
+    
+    contest_id = callback.data.split("_")[2]
+    contest = db.get_contest(contest_id)
+    
+    if not contest:
+        await callback.answer("Конкурс не найден", show_alert=True)
+        return
+    
+    status_text = "🟢 Активен" if contest.is_active() else "🔴 Завершен"
+    
+    text = (
+        f"🎁 *{contest.name}*\n\n"
+        f"📝 {contest.description}\n\n"
+        f"🏆 *Приз:* {contest.prize}\n"
+        f"📊 *Статус:* {status_text}\n"
+        f"📅 *Создан:* {contest.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        f"📅 *Окончание:* {contest.end_date.strftime('%d.%m.%Y %H:%M')}\n"
+        f"👥 *Участников:* {len(contest.participants)}\n"
+    )
+    
+    if contest.required_purchase:
+        product = db.get_product(contest.required_product_id) if contest.required_product_id else None
+        text += f"📦 *Требуется покупка:* {product.name if product else 'Неизвестный товар'}\n"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Завершить конкурс", callback_data=f"end_contest_{contest_id}")] if contest.is_active() else [],
+            [InlineKeyboardButton(text="🗑 Удалить конкурс", callback_data=f"delete_contest_{contest_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_contests_admin")]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("end_contest_"))
+async def end_contest(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав")
+        return
+    
+    contest_id = callback.data.split("_")[2]
+    contest = db.get_contest(contest_id)
+    
+    if contest:
+        contest.status = ContestStatus.ENDED
+        
+        await callback.message.edit_text(
+            f"✅ Конкурс \"{contest.name}\" завершен!\n\n"
+            f"Участников: {len(contest.participants)}\n"
+            f"Победители будут объявлены отдельно."
+        )
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_contest_"))
+async def delete_contest(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав")
+        return
+    
+    contest_id = callback.data.split("_")[2]
+    contest = db.get_contest(contest_id)
+    
+    if contest:
+        db.delete_contest(contest_id)
+        await callback.message.edit_text(f"✅ Конкурс \"{contest.name}\" удален!")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_contests_admin")
+async def back_to_contests_admin(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎁 *Управление конкурсами*\n\n"
+        "Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_contests_inline_keyboard()
+    )
     await callback.answer()
 
 # ==================== ОБРАБОТЧИКИ ОТЗЫВОВ ====================
@@ -2074,7 +2645,10 @@ async def send_screenshot_prompt(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.answer(
         f"📸 Отправьте скриншот подтверждения оплаты для заказа #{order_id}",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
     await callback.answer()
 
@@ -2135,7 +2709,10 @@ async def process_screenshot(message: Message, state: FSMContext):
 async def invalid_screenshot(message: Message):
     await message.answer(
         "❌ Пожалуйста, отправьте фото (скриншот оплаты).",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
 
 @dp.pre_checkout_query()
@@ -2229,6 +2806,24 @@ async def back_to_main(message: Message):
         reply_markup=get_main_keyboard(is_admin(message.from_user.id))
     )
 
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main_callback(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer(
+        "Главное меню",
+        reply_markup=get_main_keyboard(is_admin(callback.from_user.id))
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin_callback(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer(
+        "⚙️ Админ панель",
+        reply_markup=get_admin_keyboard()
+    )
+    await callback.answer()
+
 # ===== Управление именем продавца =====
 
 @dp.message(F.text == "👤 Установить имя")
@@ -2239,7 +2834,9 @@ async def set_bot_username_start(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_bot_username)
     await message.answer(
         "Введите имя продавца/магазина, которое будет отображаться в чеках:",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
     )
 
 @dp.message(AdminStates.waiting_for_bot_username)
@@ -2366,7 +2963,9 @@ async def reply_to_review_start(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.answer(
         f"✏️ Введите ответ на отзыв от @{review.username}:",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
     )
     await callback.answer()
 
@@ -2423,25 +3022,6 @@ async def back_to_reviews_admin(callback: CallbackQuery):
     await manage_reviews(callback.message)
     await callback.answer()
 
-# ===== Настройки группы для отзывов =====
-
-@dp.message(F.text == "⚙️ Настройки группы")
-async def group_settings(message: Message):
-    if not is_admin(message.from_user.id) or is_group_chat(message):
-        return
-    
-    group_id = db.get_reviews_group()
-    
-    text = (
-        f"⚙️ *Настройки группы для отзывов*\n\n"
-        f"Текущая группа: {f'`{group_id}`' if group_id else '❌ Не настроена'}\n\n"
-        f"Чтобы настроить группу, добавьте бота в группу как администратора, "
-        f"затем отправьте в этой группе команду /setreviewsgroup.\n\n"
-        f"Бот автоматически будет отправлять все новые отзывы в эту группу."
-    )
-    
-    await message.answer(text, parse_mode="Markdown")
-
 # ===== Управление товарами =====
 
 @dp.message(F.text == "➕ Добавить товар")
@@ -2452,7 +3032,9 @@ async def add_product_start(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_product_name)
     await message.answer(
         "Введите название товара:",
-        reply_markup=get_cancel_reply_keyboard()
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
     )
 
 @dp.message(AdminStates.waiting_for_product_name)
@@ -2467,7 +3049,12 @@ async def add_product_name(message: Message, state: FSMContext):
     
     await state.update_data(name=message.text)
     await state.set_state(AdminStates.waiting_for_product_description)
-    await message.answer("Введите описание товара:", reply_markup=get_cancel_reply_keyboard())
+    await message.answer(
+        "Введите описание товара:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
 
 @dp.message(AdminStates.waiting_for_product_description)
 async def add_product_description(message: Message, state: FSMContext):
@@ -2481,7 +3068,12 @@ async def add_product_description(message: Message, state: FSMContext):
     
     await state.update_data(description=message.text)
     await state.set_state(AdminStates.waiting_for_product_price_rub)
-    await message.answer("Введите цену в рублях (можно использовать дробные числа, например 99.99):", reply_markup=get_cancel_reply_keyboard())
+    await message.answer(
+        "Введите цену в рублях (можно использовать дробные числа, например 99.99):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
 
 @dp.message(AdminStates.waiting_for_product_price_rub)
 async def add_product_price_rub(message: Message, state: FSMContext):
@@ -2499,9 +3091,19 @@ async def add_product_price_rub(message: Message, state: FSMContext):
             raise ValueError
         await state.update_data(price_rub=price)
         await state.set_state(AdminStates.waiting_for_product_price_stars)
-        await message.answer("Введите цену в звездах (можно использовать дробные числа, например 9.99):", reply_markup=get_cancel_reply_keyboard())
+        await message.answer(
+            "Введите цену в звездах (можно использовать дробные числа, например 9.99):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
     except ValueError:
-        await message.answer("❌ Введите корректное число (можно дробное)", reply_markup=get_cancel_reply_keyboard())
+        await message.answer(
+            "❌ Введите корректное число (можно дробное)",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
 
 @dp.message(AdminStates.waiting_for_product_price_stars)
 async def add_product_price_stars(message: Message, state: FSMContext):
@@ -2519,9 +3121,19 @@ async def add_product_price_stars(message: Message, state: FSMContext):
             raise ValueError
         await state.update_data(price_stars=price)
         await state.set_state(AdminStates.waiting_for_product_stock)
-        await message.answer("Введите количество на складе (целое число):", reply_markup=get_cancel_reply_keyboard())
+        await message.answer(
+            "Введите количество на складе (целое число):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
     except ValueError:
-        await message.answer("❌ Введите корректное число (можно дробное)", reply_markup=get_cancel_reply_keyboard())
+        await message.answer(
+            "❌ Введите корректное число (можно дробное)",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
 
 @dp.message(AdminStates.waiting_for_product_stock)
 async def add_product_stock(message: Message, state: FSMContext):
@@ -2561,15 +3173,897 @@ async def add_product_stock(message: Message, state: FSMContext):
         
         await state.clear()
     except ValueError:
-        await message.answer("❌ Введите корректное целое число", reply_markup=get_cancel_reply_keyboard())
+        await message.answer(
+            "❌ Введите корректное целое число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
 
-# Продолжение кода (остальные обработчики администратора и запуск бота)...
+# ===== Редактирование товаров =====
+
+@dp.message(F.text == "✏️ Редактировать товар")
+async def edit_product_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    products = db.get_all_products()
+    if not products:
+        await message.answer("📭 Нет товаров для редактирования.")
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for product in products:
+        builder.row(InlineKeyboardButton(
+            text=f"{product.name} (ID: {product.id})",
+            callback_data=f"edit_select_{product.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await message.answer(
+        "Выберите товар для редактирования:",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(AdminStates.waiting_for_product_id_to_edit)
+
+@dp.callback_query(F.data.startswith("edit_select_"))
+async def edit_product_select(callback: CallbackQuery, state: FSMContext):
+    product_id = callback.data.split("_")[2]
+    product = db.get_product(product_id)
+    
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    
+    await state.update_data(edit_product_id=product_id)
+    await state.set_state(AdminStates.waiting_for_product_edit_field)
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📝 Название", callback_data="edit_field_name"))
+    builder.row(InlineKeyboardButton(text="📄 Описание", callback_data="edit_field_description"))
+    builder.row(InlineKeyboardButton(text="💰 Цена (рубли)", callback_data="edit_field_price_rub"))
+    builder.row(InlineKeyboardButton(text="⭐ Цена (звезды)", callback_data="edit_field_price_stars"))
+    builder.row(InlineKeyboardButton(text="📦 Количество", callback_data="edit_field_stock"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await callback.message.edit_text(
+        f"Редактирование товара *{product.name}*\n\n"
+        f"Выберите поле для редактирования:",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_field_"))
+async def edit_product_field(callback: CallbackQuery, state: FSMContext):
+    field = callback.data.split("_")[2]
+    await state.update_data(edit_field=field)
+    await state.set_state(AdminStates.waiting_for_product_edit_value)
+    
+    field_names = {
+        "name": "название",
+        "description": "описание",
+        "price_rub": "цену в рублях",
+        "price_stars": "цену в звездах",
+        "stock": "количество на складе"
+    }
+    
+    await callback.message.answer(
+        f"Введите новое {field_names.get(field, field)}:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_product_edit_value)
+async def process_product_edit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data['edit_product_id']
+    field = data['edit_field']
+    value = message.text
+    
+    product = db.get_product(product_id)
+    if not product:
+        await message.answer("❌ Товар не найден")
+        await state.clear()
+        return
+    
+    try:
+        if field == "name":
+            product.name = value
+        elif field == "description":
+            product.description = value
+        elif field == "price_rub":
+            product.price_rub = float(value.replace(',', '.'))
+        elif field == "price_stars":
+            product.price_stars = float(value.replace(',', '.'))
+        elif field == "stock":
+            product.stock = int(value)
+        
+        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
+        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        
+        await message.answer(
+            f"✅ Товар обновлен!\n\n"
+            f"ID: {product.id}\n"
+            f"Название: {product.name}\n"
+            f"Цена: {rub_price}₽ / {stars_price}⭐\n"
+            f"В наличии: {product.stock}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат данных. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+# ===== Удаление товаров =====
+
+@dp.message(F.text == "❌ Удалить товар")
+async def delete_product_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    products = db.get_all_products()
+    if not products:
+        await message.answer("📭 Нет товаров для удаления.")
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for product in products:
+        builder.row(InlineKeyboardButton(
+            text=f"❌ {product.name} (ID: {product.id})",
+            callback_data=f"delete_confirm_{product.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await message.answer(
+        "Выберите товар для удаления:",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(AdminStates.waiting_for_product_id_to_delete)
+
+@dp.callback_query(F.data.startswith("delete_confirm_"))
+async def delete_product_confirm(callback: CallbackQuery, state: FSMContext):
+    product_id = callback.data.split("_")[2]
+    product = db.get_product(product_id)
+    
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    
+    db.delete_product(product_id)
+    
+    await callback.message.edit_text(f"✅ Товар \"{product.name}\" удален!")
+    await callback.answer()
+    await state.clear()
+
+# ===== Управление промокодами =====
+
+@dp.message(F.text == "🎫 Создать промокод")
+async def create_promocode_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    await state.set_state(AdminStates.waiting_for_promocode_code)
+    await message.answer(
+        "Введите код промокода:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_promocode_code)
+async def create_promocode_code(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(promo_code=message.text.upper())
+    await state.set_state(AdminStates.waiting_for_promocode_discount)
+    await message.answer(
+        "Введите процент скидки (1-100):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+
+@dp.message(AdminStates.waiting_for_promocode_discount)
+async def create_promocode_discount(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        discount = int(message.text)
+        if discount < 1 or discount > 100:
+            raise ValueError
+        
+        await state.update_data(promo_discount=discount)
+        await state.set_state(AdminStates.waiting_for_promocode_days)
+        await message.answer(
+            "Введите количество дней действия промокода:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Введите число от 1 до 100",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.message(AdminStates.waiting_for_promocode_days)
+async def create_promocode_days(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        days = int(message.text)
+        if days < 1:
+            raise ValueError
+        
+        await state.update_data(promo_days=days)
+        await state.set_state(AdminStates.waiting_for_promocode_uses)
+        await message.answer(
+            "Введите максимальное количество использований:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число дней",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.message(AdminStates.waiting_for_promocode_uses)
+async def create_promocode_uses(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        uses = int(message.text)
+        if uses < 1:
+            raise ValueError
+        
+        data = await state.get_data()
+        promo = db.add_promocode(data['promo_code'], data['promo_discount'], data['promo_days'], uses)
+        
+        await message.answer(
+            f"✅ Промокод создан!\n\n"
+            f"Код: `{promo.code}`\n"
+            f"Скидка: {promo.discount_percent}%\n"
+            f"Действует: {promo.valid_until.strftime('%d.%m.%Y')}\n"
+            f"Использований: {promo.max_uses}",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+# ===== Реквизиты оплаты =====
+
+@dp.message(F.text == "💳 Реквизиты оплаты")
+async def payment_details_menu(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    current = db.get_payment_details()
+    
+    text = (
+        f"💳 *Текущие реквизиты оплаты:*\n\n"
+        f"Карта: `{current['card']}`\n"
+        f"Телефон: `{current['phone']}`\n"
+        f"Банк: {current['bank']}\n\n"
+        f"Выберите, что изменить:"
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Карта", callback_data="edit_card")],
+            [InlineKeyboardButton(text="📱 Телефон", callback_data="edit_phone")],
+            [InlineKeyboardButton(text="🏦 Банк", callback_data="edit_bank")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_admin")]
+        ]
+    )
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "edit_card")
+async def edit_card(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_payment_card)
+    await callback.message.answer(
+        "Введите номер карты:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "edit_phone")
+async def edit_phone(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_payment_phone)
+    await callback.message.answer(
+        "Введите номер телефона:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "edit_bank")
+async def edit_bank(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_payment_bank)
+    await callback.message.answer(
+        "Введите название банка:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_payment_card)
+async def process_card(message: Message, state: FSMContext):
+    db.update_payment_details(card=message.text)
+    await message.answer(f"✅ Номер карты обновлен: {message.text}", reply_markup=get_admin_keyboard())
+    await state.clear()
+
+@dp.message(AdminStates.waiting_for_payment_phone)
+async def process_phone(message: Message, state: FSMContext):
+    db.update_payment_details(phone=message.text)
+    await message.answer(f"✅ Номер телефона обновлен: {message.text}", reply_markup=get_admin_keyboard())
+    await state.clear()
+
+@dp.message(AdminStates.waiting_for_payment_bank)
+async def process_bank(message: Message, state: FSMContext):
+    db.update_payment_details(bank=message.text)
+    await message.answer(f"✅ Банк обновлен: {message.text}", reply_markup=get_admin_keyboard())
+    await state.clear()
+
+# ===== Статистика =====
+
+@dp.message(F.text == "📊 Статистика")
+async def show_statistics(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    total_orders = len(db.orders)
+    pending_orders = len(db.get_pending_orders())
+    active_orders = len(db.get_active_orders())
+    completed_orders = len(db.get_completed_orders())
+    total_products = len(db.products)
+    total_users = len(set(o.user_id for o in db.orders.values()))
+    total_reviews = len(db.reviews)
+    active_contests = len(db.get_active_contests())
+    
+    total_revenue_rub = sum(o.total_rub for o in db.orders.values() if o.status == OrderStatus.COMPLETED)
+    total_revenue_stars = sum(o.total_stars for o in db.orders.values() if o.status == OrderStatus.COMPLETED)
+    
+    total_revenue_rub_str = f"{total_revenue_rub:.2f}".rstrip('0').rstrip('.') if total_revenue_rub % 1 else str(int(total_revenue_rub))
+    total_revenue_stars_str = f"{total_revenue_stars:.2f}".rstrip('0').rstrip('.') if total_revenue_stars % 1 else str(int(total_revenue_stars))
+    
+    text = (
+        f"📊 *Статистика магазина*\n\n"
+        f"📦 *Заказы:*\n"
+        f"  • Всего: {total_orders}\n"
+        f"  • Ожидают оплаты: {pending_orders}\n"
+        f"  • В обработке: {active_orders}\n"
+        f"  • Завершено: {completed_orders}\n\n"
+        f"💰 *Выручка:*\n"
+        f"  • Рубли: {total_revenue_rub_str}₽\n"
+        f"  • Звезды: {total_revenue_stars_str}⭐\n\n"
+        f"👥 *Пользователи:* {total_users}\n"
+        f"🛍 *Товаров:* {total_products}\n"
+        f"⭐ *Отзывов:* {total_reviews}\n"
+        f"🎁 *Активных конкурсов:* {active_contests}"
+    )
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+
+# ===== Ответы поддержки =====
+
+@dp.message(F.text == "📨 Ответы поддержки")
+async def support_tickets_admin(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    await message.answer(
+        "📨 *Управление обращениями в поддержку*\n\n"
+        "Выберите категорию:",
+        parse_mode="Markdown",
+        reply_markup=get_support_tickets_inline_keyboard()
+    )
+
+@dp.callback_query(F.data == "tickets_pending")
+async def show_pending_tickets(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📨 *Ожидают ответа:*\n\nВыберите обращение:",
+        parse_mode="Markdown",
+        reply_markup=get_support_tickets_inline_keyboard(answered=False)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "tickets_answered")
+async def show_answered_tickets(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📨 *Отвеченные обращения:*\n\nВыберите обращение:",
+        parse_mode="Markdown",
+        reply_markup=get_support_tickets_inline_keyboard(answered=True)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tickets_page_"))
+async def tickets_pagination(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    page = int(parts[2])
+    answered = parts[3] == "True"
+    
+    await callback.message.edit_reply_markup(
+        reply_markup=get_support_tickets_inline_keyboard(page, answered)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("view_ticket_"))
+async def view_ticket(callback: CallbackQuery):
+    ticket_id = callback.data.split("_")[2]
+    ticket = db.get_ticket(ticket_id)
+    
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    
+    text = (
+        f"📨 *Тикет #{ticket.ticket_id}*\n\n"
+        f"👤 *Пользователь:* @{ticket.username} (ID: {ticket.user_id})\n"
+        f"📅 *Создан:* {ticket.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        f"📊 *Статус:* {'✅ Отвечен' if ticket.answered else '⏳ Ожидает ответа'}\n\n"
+        f"💬 *Сообщение:*\n{ticket.message}\n"
+    )
+    
+    if ticket.replies:
+        text += f"\n📝 *История ответов:*\n"
+        for reply in ticket.replies:
+            text += f"  • {reply['created_at'].strftime('%d.%m.%Y %H:%M')}: {reply['text']}\n"
+    
+    if ticket.answered:
+        text += f"\n👨‍💼 *Ответ:*\n{ticket.answer_message}\n"
+        text += f"📅 *Ответ дан:* {ticket.answered_at.strftime('%d.%m.%Y %H:%M')}"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Ответить", callback_data=f"answer_ticket_{ticket_id}")] if not ticket.answered else [],
+            [InlineKeyboardButton(text="📝 Добавить ответ", callback_data=f"reply_ticket_{ticket_id}")] if ticket.answered else [],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_tickets")]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("answer_ticket_"))
+async def answer_ticket_start(callback: CallbackQuery, state: FSMContext):
+    ticket_id = callback.data.split("_")[2]
+    ticket = db.get_ticket(ticket_id)
+    
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_ticket_answer)
+    await state.update_data(ticket_id=ticket_id, user_id=ticket.user_id)
+    
+    await callback.message.answer(
+        f"✏️ Введите ответ на обращение #{ticket_id} для @{ticket.username}:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("reply_ticket_"))
+async def reply_ticket_start(callback: CallbackQuery, state: FSMContext):
+    ticket_id = callback.data.split("_")[2]
+    ticket = db.get_ticket(ticket_id)
+    
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_ticket_reply)
+    await state.update_data(ticket_id=ticket_id, user_id=ticket.user_id)
+    
+    await callback.message.answer(
+        f"✏️ Введите дополнительный ответ для @{ticket.username}:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+        )
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_ticket_answer)
+async def process_ticket_answer(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data['ticket_id']
+    user_id = data['user_id']
+    
+    db.answer_ticket(ticket_id, message.from_user.id, message.text)
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"📨 *Ответ на ваше обращение #{ticket_id}*\n\n"
+            f"{message.text}\n\n"
+            f"По всем вопросам вы можете написать снова в поддержку.",
+            parse_mode="Markdown"
+        )
+        
+        await message.answer(
+            f"✅ Ответ отправлен пользователю!",
+            reply_markup=get_admin_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Failed to send answer to user {user_id}: {e}")
+        await message.answer(
+            "❌ Не удалось отправить ответ пользователю. Возможно, пользователь заблокировал бота.",
+            reply_markup=get_admin_keyboard()
+        )
+    
+    await state.clear()
+
+@dp.message(AdminStates.waiting_for_ticket_reply)
+async def process_ticket_reply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data['ticket_id']
+    user_id = data['user_id']
+    
+    db.add_ticket_reply(ticket_id, message.from_user.id, message.text)
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"📨 *Новый ответ по вашему обращению #{ticket_id}*\n\n"
+            f"{message.text}\n\n"
+            f"По всем вопросам вы можете написать снова в поддержку.",
+            parse_mode="Markdown"
+        )
+        
+        await message.answer(
+            f"✅ Дополнительный ответ отправлен пользователю!",
+            reply_markup=get_admin_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Failed to send reply to user {user_id}: {e}")
+        await message.answer(
+            "❌ Не удалось отправить ответ пользователю.",
+            reply_markup=get_admin_keyboard()
+        )
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "back_to_tickets")
+async def back_to_tickets(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📨 *Управление обращениями в поддержку*\n\n"
+        "Выберите категорию:",
+        parse_mode="Markdown",
+        reply_markup=get_support_tickets_inline_keyboard()
+    )
+    await callback.answer()
+
+# ===== Управление заказами (админ) =====
+
+@dp.message(F.text == "📦 Все заказы")
+async def admin_all_orders(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    orders = list(db.orders.values())
+    orders.sort(key=lambda x: x.created_at, reverse=True)
+    
+    if not orders:
+        await message.answer("📭 Нет заказов.")
+        return
+    
+    for order in orders[:10]:
+        status_emoji = {
+            OrderStatus.PENDING: "⏳",
+            OrderStatus.PAID: "✅",
+            OrderStatus.CONFIRMED: "👍",
+            OrderStatus.COMPLETED: "🎉",
+            OrderStatus.CANCELLED: "❌"
+        }.get(order.status, "❓")
+        
+        status_text = {
+            OrderStatus.PENDING: "Ожидает оплаты",
+            OrderStatus.PAID: "Оплачено",
+            OrderStatus.CONFIRMED: "Подтверждено",
+            OrderStatus.COMPLETED: "Завершен",
+            OrderStatus.CANCELLED: "Отменен"
+        }.get(order.status, order.status.value)
+        
+        payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
+        
+        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        
+        text = (
+            f"{status_emoji} *Заказ #{order.order_id}*\n"
+            f"👤 @{order.username} (ID: {order.user_id})\n"
+            f"📅 {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"💳 {payment_method}\n"
+            f"💰 {total_rub_str}₽ / {total_stars_str}⭐\n"
+            f"📊 {status_text}\n"
+        )
+        
+        keyboard = get_order_actions_inline_keyboard(order.order_id, is_admin=True)
+        await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+    
+    if len(orders) > 10:
+        await message.answer(f"Показано 10 из {len(orders)} заказов")
+
+@dp.message(F.text == "⏳ Ожидают оплаты")
+async def admin_pending_orders(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    orders = db.get_pending_orders()
+    orders.sort(key=lambda x: x.created_at, reverse=True)
+    
+    if not orders:
+        await message.answer("📭 Нет заказов, ожидающих оплаты.")
+        return
+    
+    for order in orders[:10]:
+        payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
+        
+        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        
+        text = (
+            f"⏳ *Заказ #{order.order_id}*\n"
+            f"👤 @{order.username} (ID: {order.user_id})\n"
+            f"📅 {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"💳 {payment_method}\n"
+            f"💰 {total_rub_str}₽ / {total_stars_str}⭐\n"
+            f"📊 Ожидает оплаты\n"
+        )
+        
+        keyboard = get_order_actions_inline_keyboard(order.order_id, is_admin=True)
+        await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+    
+    if len(orders) > 10:
+        await message.answer(f"Показано 10 из {len(orders)} заказов")
+
+@dp.message(F.text == "🔄 Активные заказы")
+async def admin_active_orders(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    orders = db.get_active_orders()
+    orders.sort(key=lambda x: x.created_at, reverse=True)
+    
+    if not orders:
+        await message.answer("📭 Нет активных заказов.")
+        return
+    
+    for order in orders[:10]:
+        status_emoji = "✅" if order.status == OrderStatus.PAID else "👍"
+        status_text = "Оплачено" if order.status == OrderStatus.PAID else "Подтверждено"
+        payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
+        
+        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        
+        text = (
+            f"{status_emoji} *Заказ #{order.order_id}*\n"
+            f"👤 @{order.username} (ID: {order.user_id})\n"
+            f"📅 {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"💳 {payment_method}\n"
+            f"💰 {total_rub_str}₽ / {total_stars_str}⭐\n"
+            f"📊 {status_text}\n"
+        )
+        
+        keyboard = get_order_actions_inline_keyboard(order.order_id, is_admin=True)
+        await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+    
+    if len(orders) > 10:
+        await message.answer(f"Показано 10 из {len(orders)} заказов")
+
+@dp.message(F.text == "✅ Завершенные заказы")
+async def admin_completed_orders(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    orders = db.get_completed_orders()
+    orders.sort(key=lambda x: x.completed_at or x.created_at, reverse=True)
+    
+    if not orders:
+        await message.answer("📭 Нет завершенных заказов.")
+        return
+    
+    for order in orders[:10]:
+        payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
+        
+        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        
+        text = (
+            f"🎉 *Заказ #{order.order_id}*\n"
+            f"👤 @{order.username} (ID: {order.user_id})\n"
+            f"📅 {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"✅ Завершен: {order.completed_at.strftime('%d.%m.%Y %H:%M') if order.completed_at else 'Неизвестно'}\n"
+            f"💳 {payment_method}\n"
+            f"💰 {total_rub_str}₽ / {total_stars_str}⭐\n"
+        )
+        
+        await message.answer(text, parse_mode="Markdown")
+    
+    if len(orders) > 10:
+        await message.answer(f"Показано 10 из {len(orders)} заказов")
+
+# ===== Действия с заказами (админ) =====
+
+@dp.callback_query(F.data.startswith("admin_confirm_"))
+async def admin_confirm_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    order_id = callback.data.split("_")[2]
+    order = db.get_order(order_id)
+    
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    
+    db.update_order_status(order_id, OrderStatus.CONFIRMED)
+    
+    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+    total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+    
+    try:
+        await bot.send_message(
+            order.user_id,
+            f"✅ *Заказ #{order_id} подтвержден!*\n\n"
+            f"Ваш заказ на сумму {total_rub_str}₽ / {total_stars_str}⭐ подтвержден и передан в обработку.\n"
+            f"Ожидайте выполнения.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.message.edit_text(
+        f"✅ Заказ #{order_id} подтвержден!",
+        reply_markup=get_order_actions_inline_keyboard(order_id, is_admin=True)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_cancel_"))
+async def admin_cancel_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    order_id = callback.data.split("_")[2]
+    order = db.get_order(order_id)
+    
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    
+    db.update_order_status(order_id, OrderStatus.CANCELLED)
+    
+    try:
+        await bot.send_message(
+            order.user_id,
+            f"❌ *Заказ #{order_id} отменен*\n\n"
+            f"Ваш заказ был отменен администратором.\n"
+            f"По вопросам обращайтесь в поддержку.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.message.edit_text(f"❌ Заказ #{order_id} отменен!")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_complete_"))
+async def admin_complete_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    order_id = callback.data.split("_")[2]
+    order = db.get_order(order_id)
+    
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    
+    db.update_order_status(order_id, OrderStatus.COMPLETED, callback.from_user.id)
+    
+    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+    total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+    
+    try:
+        await bot.send_message(
+            order.user_id,
+            f"🎉 *Заказ #{order_id} выполнен!*\n\n"
+            f"Ваш заказ на сумму {total_rub_str}₽ / {total_stars_str}⭐ успешно выполнен.\n"
+            f"Спасибо за покупку!",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.message.edit_text(
+        f"🎉 Заказ #{order_id} завершен!",
+        reply_markup=get_order_actions_inline_keyboard(order_id, is_admin=True)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("view_screen_"))
+async def view_screenshot(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    order_id = callback.data.split("_")[2]
+    order = db.get_order(order_id)
+    
+    if not order or not order.screenshot_file_id:
+        await callback.answer("Скриншот не найден", show_alert=True)
+        return
+    
+    await callback.message.answer_photo(
+        order.screenshot_file_id,
+        caption=f"📸 Скриншот оплаты для заказа #{order_id}"
+    )
+    await callback.answer()
 
 # ==================== ЗАПУСК БОТА ====================
 
 async def on_startup():
     logger.info("Бот запущен!")
     
+    # Добавляем тестовые товары
     db.add_product(
         "Тестовый товар 1",
         "Описание тестового товара 1",
@@ -2592,8 +4086,19 @@ async def on_startup():
         200
     )
     
+    # Добавляем тестовые промокоды
     db.add_promocode("TEST10", 10, 30, 100)
     db.add_promocode("SALE20", 20, 14, 50)
+    
+    # Добавляем тестовый конкурс
+    db.add_contest(
+        "Новогодний розыгрыш",
+        "Участвуйте в розыгрыше новогодних призов!",
+        "Сертификат на 1000 рублей",
+        False,
+        None,
+        7
+    )
     
     bot_info = await bot.get_me()
     db.set_bot_username(bot_info.first_name or "ShopBot")
@@ -2604,11 +4109,12 @@ async def on_startup():
                 admin_id,
                 "✅ Бот магазина запущен и готов к работе!\n\n"
                 "✨ *Новые функции:*\n"
+                "• 🎁 Система конкурсов с обязательной покупкой\n"
                 "• 🧾 Чеки с именем продавца\n"
                 "• 📦 Разделение заказов на активные и завершенные\n"
                 "• 🔄 Обновление статуса заказов\n"
                 "• 👤 Установка имени продавца\n"
-                "• ✏️ Ручной ввод количества товара с inline-отменой\n\n"
+                "• ✏️ Ручной ввод количества товара\n\n"
                 "Чтобы настроить группу для отзывов:\n"
                 "1. Добавьте бота в группу как администратора\n"
                 "2. Отправьте в группе команду /setreviewsgroup",
