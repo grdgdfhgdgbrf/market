@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 import uuid
-import re
+import random
+import json
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -20,7 +21,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Конфигурация бота
@@ -49,6 +53,16 @@ class ContestStatus(Enum):
     DRAFT = "draft"
     ACTIVE = "active"
     ENDED = "ended"
+    CANCELLED = "cancelled"
+
+class PrizeType(Enum):
+    DISCOUNT_PROMOCODE = "discount_promocode"
+    FREE_PRODUCT = "free_product"
+    CASH_REWARD = "cash_reward"
+    STARS_REWARD = "stars_reward"
+    CUSTOM_PRIZE = "custom_prize"
+    COUPON = "coupon"
+    MYSTERY_BOX = "mystery_box"
 
 class Product:
     def __init__(self, id: str, name: str, description: str, price_rub: float, price_stars: float, stock: int = 999):
@@ -59,42 +73,198 @@ class Product:
         self.price_stars = float(price_stars)
         self.stock = stock
         self.created_at = datetime.now()
+        self.purchases_count = 0
+        self.revenue_rub = 0.0
+        self.revenue_stars = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'price_rub': self.price_rub,
+            'price_stars': self.price_stars,
+            'stock': self.stock,
+            'created_at': self.created_at.isoformat(),
+            'purchases_count': self.purchases_count,
+            'revenue_rub': self.revenue_rub,
+            'revenue_stars': self.revenue_stars
+        }
 
 class Promotion:
-    def __init__(self, code: str, discount_percent: int, valid_until: datetime, max_uses: int = 1):
+    def __init__(self, code: str, discount_percent: int, valid_until: datetime, 
+                 max_uses: int = 1, min_order_amount: float = 0,
+                 applicable_products: List[str] = None):
         self.code = code.upper()
         self.discount_percent = discount_percent
         self.valid_until = valid_until
         self.max_uses = max_uses
+        self.min_order_amount = min_order_amount
+        self.applicable_products = applicable_products or []
         self.used_count = 0
         self.is_active = True
 
+class Prize:
+    def __init__(self, prize_type: PrizeType, value: Any, description: str = None):
+        self.id = str(uuid.uuid4())[:8]
+        self.type = prize_type
+        self.value = value
+        self.description = description or self._generate_description()
+        self.created_at = datetime.now()
+        self.claimed = False
+        self.claimed_by = None
+        self.claimed_at = None
+
+    def _generate_description(self) -> str:
+        if self.type == PrizeType.DISCOUNT_PROMOCODE:
+            return f"Промокод на скидку {self.value}%"
+        elif self.type == PrizeType.FREE_PRODUCT:
+            return f"Бесплатный товар (ID: {self.value})"
+        elif self.type == PrizeType.CASH_REWARD:
+            return f"Денежный приз {self.value}₽"
+        elif self.type == PrizeType.STARS_REWARD:
+            return f"Приз {self.value}⭐"
+        elif self.type == PrizeType.CUSTOM_PRIZE:
+            return self.value
+        elif self.type == PrizeType.COUPON:
+            return f"Купон: {self.value}"
+        elif self.type == PrizeType.MYSTERY_BOX:
+            return "Секретный приз"
+        return "Приз"
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'type': self.type.value,
+            'value': self.value,
+            'description': self.description,
+            'created_at': self.created_at.isoformat(),
+            'claimed': self.claimed,
+            'claimed_by': self.claimed_by,
+            'claimed_at': self.claimed_at.isoformat() if self.claimed_at else None
+        }
+
 class Contest:
-    def __init__(self, id: str, name: str, description: str, prize: str, 
-                 required_purchase: bool = False, required_product_id: str = None,
-                 start_date: datetime = None, end_date: datetime = None):
+    def __init__(self, id: str, name: str, description: str, prizes: List[Prize],
+                 required_products: List[str] = None, min_purchase_amount: float = 0,
+                 max_participants: int = 0, start_date: datetime = None, 
+                 end_date: datetime = None, winners_count: int = 1):
         self.id = id
         self.name = name
         self.description = description
-        self.prize = prize
-        self.required_purchase = required_purchase
-        self.required_product_id = required_product_id
+        self.prizes = prizes
+        self.required_products = required_products or []
+        self.min_purchase_amount = min_purchase_amount
+        self.max_participants = max_participants
         self.start_date = start_date or datetime.now()
         self.end_date = end_date or (datetime.now() + timedelta(days=7))
-        self.status = ContestStatus.ACTIVE
+        self.winners_count = winners_count
+        self.status = ContestStatus.DRAFT
         self.participants = []  # list of user_ids
-        self.winners = []
+        self.winners = []  # list of (user_id, prize)
         self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+        self.auto_select_winners = True
     
     def is_active(self) -> bool:
         return self.status == ContestStatus.ACTIVE and datetime.now() < self.end_date
     
-    def add_participant(self, user_id: int):
+    def can_participate(self) -> bool:
+        if self.status != ContestStatus.ACTIVE:
+            return False
+        if datetime.now() > self.end_date:
+            return False
+        if self.max_participants > 0 and len(self.participants) >= self.max_participants:
+            return False
+        return True
+    
+    def add_participant(self, user_id: int) -> bool:
+        if not self.can_participate():
+            return False
         if user_id not in self.participants:
             self.participants.append(user_id)
+            self.updated_at = datetime.now()
+            return True
+        return False
     
     def has_participated(self, user_id: int) -> bool:
         return user_id in self.participants
+    
+    def check_purchase_requirements(self, user_id: int, db_connection) -> Tuple[bool, str]:
+        """Проверяет, выполнил ли пользователь требования для участия"""
+        if not self.required_products and self.min_purchase_amount <= 0:
+            return True, "Требования отсутствуют"
+        
+        user_orders = db_connection.get_user_orders(user_id)
+        completed_orders = [o for o in user_orders if o.status == OrderStatus.COMPLETED]
+        
+        total_purchased_amount = 0.0
+        purchased_products = set()
+        
+        for order in completed_orders:
+            total_purchased_amount += order.total_rub
+            for product_id in order.items:
+                purchased_products.add(product_id)
+        
+        # Проверка обязательных товаров
+        if self.required_products:
+            missing_products = []
+            for req_product in self.required_products:
+                if req_product not in purchased_products:
+                    missing_products.append(req_product)
+            
+            if missing_products:
+                product_names = []
+                for prod_id in missing_products:
+                    product = db_connection.get_product(prod_id)
+                    product_names.append(product.name if product else prod_id)
+                return False, f"Необходимо приобрести: {', '.join(product_names)}"
+        
+        # Проверка минимальной суммы покупки
+        if self.min_purchase_amount > 0 and total_purchased_amount < self.min_purchase_amount:
+            return False, f"Необходимо совершить покупок на сумму {self.min_purchase_amount}₽ (у вас: {total_purchased_amount}₽)"
+        
+        return True, "Требования выполнены"
+    
+    def select_winners(self) -> List[Tuple[int, Prize]]:
+        """Выбирает победителей случайным образом"""
+        if not self.participants:
+            return []
+        
+        winners = []
+        available_prizes = self.prizes.copy()
+        
+        for i in range(min(self.winners_count, len(self.participants))):
+            if not available_prizes:
+                break
+            
+            participant = random.choice(self.participants)
+            prize = random.choice(available_prizes)
+            
+            winners.append((participant, prize))
+            available_prizes.remove(prize)
+        
+        self.winners = winners
+        return winners
+    
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'prizes': [p.to_dict() for p in self.prizes],
+            'required_products': self.required_products,
+            'min_purchase_amount': self.min_purchase_amount,
+            'max_participants': self.max_participants,
+            'start_date': self.start_date.isoformat(),
+            'end_date': self.end_date.isoformat(),
+            'winners_count': self.winners_count,
+            'status': self.status.value,
+            'participants': self.participants,
+            'winners': self.winners,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
 
 class Order:
     def __init__(self, order_id: str, user_id: int, username: str, items: Dict[str, int], 
@@ -167,6 +337,7 @@ class Database:
         self.support_tickets = {}
         self.reviews = []
         self.contests = {}
+        self.generated_coupons = {}
         self.payment_details = {
             "card": "2200 0000 0000 0000",
             "phone": "+7 (999) 999-99-99",
@@ -178,7 +349,16 @@ class Database:
         self.next_contest_id = 1
         self.reviews_group_id = None
         self.bot_username = "ShopBot"
+        self.stats = {
+            'total_users': set(),
+            'total_orders': 0,
+            'total_revenue_rub': 0.0,
+            'total_revenue_stars': 0.0,
+            'total_contests': 0,
+            'total_participants': 0
+        }
 
+    # ===== Управление товарами =====
     def add_product(self, name: str, description: str, price_rub: float, price_stars: float, stock: int) -> Product:
         product_id = str(self.next_product_id)
         self.next_product_id += 1
@@ -207,6 +387,7 @@ class Database:
     def get_all_products(self) -> List[Product]:
         return list(self.products.values())
 
+    # ===== Корзина =====
     def get_cart(self, user_id: int) -> UserCart:
         if user_id not in self.carts:
             self.carts[user_id] = UserCart(user_id)
@@ -235,14 +416,17 @@ class Database:
             self.carts[user_id].promocode = None
             self.carts[user_id].discount = 0
 
-    def add_promocode(self, code: str, discount: int, days_valid: int = 7, max_uses: int = 1) -> Promotion:
+    # ===== Промокоды =====
+    def add_promocode(self, code: str, discount: int, days_valid: int = 7, 
+                      max_uses: int = 1, min_order_amount: float = 0,
+                      applicable_products: List[str] = None) -> Promotion:
         code = code.upper()
         valid_until = datetime.now() + timedelta(days=days_valid)
-        promo = Promotion(code, discount, valid_until, max_uses)
+        promo = Promotion(code, discount, valid_until, max_uses, min_order_amount, applicable_products)
         self.promocodes[code] = promo
         return promo
 
-    def validate_promocode(self, code: str) -> Tuple[bool, int, str]:
+    def validate_promocode(self, code: str, cart_total: float = 0, cart_products: List[str] = None) -> Tuple[bool, int, str]:
         code = code.upper()
         if code not in self.promocodes:
             return False, 0, "Промокод не найден"
@@ -257,6 +441,14 @@ class Database:
         if promo.used_count >= promo.max_uses:
             return False, 0, "Промокод больше недействителен"
         
+        if promo.min_order_amount > 0 and cart_total < promo.min_order_amount:
+            return False, 0, f"Минимальная сумма заказа для промокода: {promo.min_order_amount}₽"
+        
+        if promo.applicable_products and cart_products:
+            applicable = any(p in promo.applicable_products for p in cart_products)
+            if not applicable:
+                return False, 0, "Промокод не применяется к товарам в корзине"
+        
         return True, promo.discount_percent, f"Скидка {promo.discount_percent}%"
 
     def use_promocode(self, code: str) -> bool:
@@ -266,6 +458,7 @@ class Database:
             return True
         return False
 
+    # ===== Заказы =====
     def create_order(self, user_id: int, username: str, cart: UserCart, payment_method: PaymentMethod = None) -> Order:
         order_id = str(uuid.uuid4())[:8].upper()
         items = cart.items.copy()
@@ -277,6 +470,9 @@ class Database:
             if product:
                 total_rub += product.price_rub * quantity
                 total_stars += product.price_stars * quantity
+                product.purchases_count += quantity
+                product.revenue_rub += product.price_rub * quantity
+                product.revenue_stars += product.price_stars * quantity
         
         if cart.discount > 0:
             total_rub = total_rub * (100 - cart.discount) / 100
@@ -286,6 +482,11 @@ class Database:
         order.promocode_used = cart.promocode
         
         self.orders[order_id] = order
+        self.stats['total_users'].add(user_id)
+        self.stats['total_orders'] += 1
+        self.stats['total_revenue_rub'] += total_rub
+        self.stats['total_revenue_stars'] += total_stars
+        
         return order
 
     def get_order(self, order_id: str) -> Optional[Order]:
@@ -331,6 +532,7 @@ class Database:
             return True
         return False
 
+    # ===== Поддержка =====
     def create_ticket(self, user_id: int, username: str, message: str, message_id: int) -> SupportTicket:
         ticket_id = f"T{self.next_ticket_id:04d}"
         self.next_ticket_id += 1
@@ -365,6 +567,7 @@ class Database:
             return True
         return False
 
+    # ===== Отзывы =====
     def add_review(self, user_id: int, username: str, order_id: str, rating: int, comment: str) -> Review:
         review_id = str(self.next_review_id)
         self.next_review_id += 1
@@ -395,34 +598,19 @@ class Database:
     def get_reviews_group(self) -> Optional[int]:
         return self.reviews_group_id
 
-    def set_bot_username(self, username: str):
-        self.bot_username = username
-
-    def get_bot_username(self) -> str:
-        return self.bot_username
-
-    def update_payment_details(self, card: str = None, phone: str = None, bank: str = None):
-        if card:
-            self.payment_details["card"] = card
-        if phone:
-            self.payment_details["phone"] = phone
-        if bank:
-            self.payment_details["bank"] = bank
-
-    def get_payment_details(self) -> dict:
-        return self.payment_details.copy()
-
-    # Методы для конкурсов
-    def add_contest(self, name: str, description: str, prize: str, 
-                    required_purchase: bool = False, required_product_id: str = None,
-                    days_valid: int = 7) -> Contest:
+    # ===== Конкурсы =====
+    def add_contest(self, name: str, description: str, prizes: List[Prize],
+                    required_products: List[str] = None, min_purchase_amount: float = 0,
+                    max_participants: int = 0, days_valid: int = 7, 
+                    winners_count: int = 1) -> Contest:
         contest_id = str(self.next_contest_id)
         self.next_contest_id += 1
         end_date = datetime.now() + timedelta(days=days_valid)
-        contest = Contest(contest_id, name, description, prize, 
-                         required_purchase, required_product_id,
-                         datetime.now(), end_date)
+        contest = Contest(contest_id, name, description, prizes,
+                         required_products, min_purchase_amount,
+                         max_participants, datetime.now(), end_date, winners_count)
         self.contests[contest_id] = contest
+        self.stats['total_contests'] += 1
         return contest
 
     def get_contest(self, contest_id: str) -> Optional[Contest]:
@@ -440,6 +628,7 @@ class Database:
             for key, value in kwargs.items():
                 if hasattr(contest, key):
                     setattr(contest, key, value)
+            contest.updated_at = datetime.now()
             return True
         return False
 
@@ -449,12 +638,25 @@ class Database:
             return True
         return False
 
-    def participate_in_contest(self, contest_id: str, user_id: int) -> bool:
+    def participate_in_contest(self, contest_id: str, user_id: int) -> Tuple[bool, str]:
         contest = self.get_contest(contest_id)
-        if contest and contest.is_active():
-            contest.add_participant(user_id)
-            return True
-        return False
+        if not contest:
+            return False, "Конкурс не найден"
+        
+        if not contest.can_participate():
+            return False, "Конкурс недоступен для участия"
+        
+        if contest.has_participated(user_id):
+            return False, "Вы уже участвуете в этом конкурсе"
+        
+        # Проверка требований к покупкам
+        passed, message = contest.check_purchase_requirements(user_id, self)
+        if not passed:
+            return False, message
+        
+        contest.add_participant(user_id)
+        self.stats['total_participants'] += 1
+        return True, "Вы успешно участвуете в конкурсе! Удачи!"
 
     def has_participated_in_contest(self, contest_id: str, user_id: int) -> bool:
         contest = self.get_contest(contest_id)
@@ -462,22 +664,74 @@ class Database:
             return contest.has_participated(user_id)
         return False
 
-    def check_purchase_requirement(self, contest_id: str, user_id: int) -> bool:
+    def end_contest_and_select_winners(self, contest_id: str) -> List[Tuple[int, Prize]]:
         contest = self.get_contest(contest_id)
-        if not contest or not contest.required_purchase:
-            return True
+        if contest:
+            contest.status = ContestStatus.ENDED
+            winners = contest.select_winners()
+            return winners
+        return []
+
+    # ===== Купоны =====
+    def generate_coupon(self, prize_id: str, user_id: int, code: str = None) -> str:
+        coupon_code = code or str(uuid.uuid4())[:8].upper()
+        self.generated_coupons[coupon_code] = {
+            'prize_id': prize_id,
+            'user_id': user_id,
+            'used': False,
+            'created_at': datetime.now(),
+            'used_at': None
+        }
+        return coupon_code
+
+    def use_coupon(self, coupon_code: str, user_id: int) -> Tuple[bool, str]:
+        coupon = self.generated_coupons.get(coupon_code)
+        if not coupon:
+            return False, "Купон не найден"
         
-        if not contest.required_product_id:
-            return True
+        if coupon['used']:
+            return False, "Купон уже использован"
         
-        # Проверяем, покупал ли пользователь нужный товар
-        user_orders = self.get_user_orders(user_id)
-        for order in user_orders:
-            if order.status == OrderStatus.COMPLETED:
-                for product_id in order.items:
-                    if product_id == contest.required_product_id:
-                        return True
-        return False
+        if coupon['user_id'] != user_id:
+            return False, "Этот купон не принадлежит вам"
+        
+        coupon['used'] = True
+        coupon['used_at'] = datetime.now()
+        return True, "Купон активирован"
+
+    # ===== Настройки =====
+    def set_bot_username(self, username: str):
+        self.bot_username = username
+
+    def get_bot_username(self) -> str:
+        return self.bot_username
+
+    def update_payment_details(self, card: str = None, phone: str = None, bank: str = None):
+        if card:
+            self.payment_details["card"] = card
+        if phone:
+            self.payment_details["phone"] = phone
+        if bank:
+            self.payment_details["bank"] = bank
+
+    def get_payment_details(self) -> dict:
+        return self.payment_details.copy()
+
+    def get_stats(self) -> dict:
+        return {
+            'total_users': len(self.stats['total_users']),
+            'total_orders': self.stats['total_orders'],
+            'total_revenue_rub': self.stats['total_revenue_rub'],
+            'total_revenue_stars': self.stats['total_revenue_stars'],
+            'total_products': len(self.products),
+            'total_reviews': len(self.reviews),
+            'total_contests': self.stats['total_contests'],
+            'total_participants': self.stats['total_participants'],
+            'active_contests': len(self.get_active_contests()),
+            'pending_orders': len(self.get_pending_orders()),
+            'active_orders': len(self.get_active_orders()),
+            'completed_orders': len(self.get_completed_orders())
+        }
 
 db = Database()
 
@@ -510,27 +764,6 @@ def get_admin_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def get_cancel_inline_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
-    return builder.as_markup()
-
-def get_reviews_keyboard():
-    buttons = [
-        [KeyboardButton(text="📝 Написать отзыв")],
-        [KeyboardButton(text="📖 Все отзывы")],
-        [KeyboardButton(text="🔙 На главную")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-def get_my_orders_keyboard():
-    buttons = [
-        [KeyboardButton(text="🔄 Активные заказы")],
-        [KeyboardButton(text="✅ Завершенные заказы")],
-        [KeyboardButton(text="🔙 На главную")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
 def get_products_inline_keyboard(page: int = 0, items_per_page: int = 5):
     products = db.get_all_products()
     total_pages = (len(products) + items_per_page - 1) // items_per_page
@@ -543,8 +776,8 @@ def get_products_inline_keyboard(page: int = 0, items_per_page: int = 5):
     
     for product in page_products:
         stock_status = f" (в наличии: {product.stock})" if product.stock > 0 else " (нет в наличии)"
-        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        rub_price = format_price(product.price_rub)
+        stars_price = format_price(product.price_stars)
         
         builder.row(InlineKeyboardButton(
             text=f"{product.name} - {rub_price}₽ / {stars_price}⭐{stock_status}",
@@ -743,10 +976,15 @@ def get_contests_inline_keyboard():
     builder = InlineKeyboardBuilder()
     
     for contest in contests:
+        participants_count = len(contest.participants)
+        max_participants = contest.max_participants if contest.max_participants > 0 else "∞"
         builder.row(InlineKeyboardButton(
-            text=f"🎁 {contest.name}",
+            text=f"🎁 {contest.name} (Участников: {participants_count}/{max_participants})",
             callback_data=f"contest_{contest.id}"
         ))
+    
+    if not contests:
+        builder.row(InlineKeyboardButton(text="📭 Нет активных конкурсов", callback_data="noop"))
     
     builder.row(InlineKeyboardButton(text="◀️ На главную", callback_data="back_to_main"))
     
@@ -758,9 +996,15 @@ def get_admin_contests_inline_keyboard():
     builder = InlineKeyboardBuilder()
     
     for contest in contests:
-        status = "🟢" if contest.is_active() else "🔴"
+        status_emoji = {
+            ContestStatus.DRAFT: "📝",
+            ContestStatus.ACTIVE: "🟢",
+            ContestStatus.ENDED: "🔴",
+            ContestStatus.CANCELLED: "⚫"
+        }.get(contest.status, "❓")
+        
         builder.row(InlineKeyboardButton(
-            text=f"{status} {contest.name}",
+            text=f"{status_emoji} {contest.name}",
             callback_data=f"admin_contest_{contest.id}"
         ))
     
@@ -768,6 +1012,33 @@ def get_admin_contests_inline_keyboard():
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_admin"))
     
     return builder.as_markup()
+
+def get_prize_type_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🎫 Промокод на скидку", callback_data="prize_type_discount"))
+    builder.row(InlineKeyboardButton(text="🎁 Бесплатный товар", callback_data="prize_type_product"))
+    builder.row(InlineKeyboardButton(text="💰 Денежный приз", callback_data="prize_type_cash"))
+    builder.row(InlineKeyboardButton(text="⭐ Приз звездами", callback_data="prize_type_stars"))
+    builder.row(InlineKeyboardButton(text="🎨 Индивидуальный приз", callback_data="prize_type_custom"))
+    builder.row(InlineKeyboardButton(text="🎟️ Купон", callback_data="prize_type_coupon"))
+    builder.row(InlineKeyboardButton(text="📦 Секретный приз", callback_data="prize_type_mystery"))
+    builder.row(InlineKeyboardButton(text="✅ Завершить добавление", callback_data="prize_done"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    return builder.as_markup()
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+def format_price(price: float) -> str:
+    """Форматирует цену для отображения"""
+    if price % 1 == 0:
+        return str(int(price))
+    return f"{price:.2f}".rstrip('0').rstrip('.')
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def is_group_chat(message: Message) -> bool:
+    return message.chat.type in ['group', 'supergroup']
 
 # ==================== СОСТОЯНИЯ FSM ====================
 
@@ -785,20 +1056,25 @@ class AdminStates(StatesGroup):
     waiting_for_promocode_discount = State()
     waiting_for_promocode_days = State()
     waiting_for_promocode_uses = State()
+    waiting_for_promocode_min_amount = State()
     waiting_for_payment_card = State()
     waiting_for_payment_phone = State()
     waiting_for_payment_bank = State()
     waiting_for_ticket_answer = State()
     waiting_for_ticket_reply = State()
     waiting_for_review_reply = State()
-    waiting_for_group_setup = State()
     waiting_for_bot_username = State()
     waiting_for_contest_name = State()
     waiting_for_contest_description = State()
-    waiting_for_contest_prize = State()
+    waiting_for_contest_prize_type = State()
+    waiting_for_contest_prize_value = State()
+    waiting_for_contest_prize_description = State()
     waiting_for_contest_days = State()
-    waiting_for_contest_required_purchase = State()
-    waiting_for_contest_required_product = State()
+    waiting_for_contest_winners_count = State()
+    waiting_for_contest_max_participants = State()
+    waiting_for_contest_required_products = State()
+    waiting_for_contest_min_amount = State()
+    waiting_for_contest_product_selection = State()
 
 class UserStates(StatesGroup):
     waiting_for_promocode = State()
@@ -806,16 +1082,7 @@ class UserStates(StatesGroup):
     waiting_for_screenshot = State()
     waiting_for_review_rating = State()
     waiting_for_review_comment = State()
-    waiting_for_order_selection = State()
     waiting_for_manual_quantity = State()
-
-# ==================== ФИЛЬТРЫ ====================
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def is_group_chat(message: Message) -> bool:
-    return message.chat.type in ['group', 'supergroup']
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
@@ -829,6 +1096,7 @@ async def cmd_start(message: Message):
     await message.answer(
         f"👋 Добро пожаловать в магазин!\n\n"
         f"Здесь вы можете приобрести товары за звезды или рубли.\n"
+        f"Участвуйте в конкурсах и выигрывайте призы!\n\n"
         f"Используйте кнопки ниже для навигации.",
         reply_markup=get_main_keyboard(is_admin(user_id))
     )
@@ -935,27 +1203,27 @@ async def show_cart(message: Message):
         total_stars = total_stars * (100 - cart.discount) / 100
     
     for item in items_details:
-        rub_price = f"{item['price_rub']:.2f}".rstrip('0').rstrip('.') if item['price_rub'] % 1 else str(int(item['price_rub']))
-        stars_price = f"{item['price_stars']:.2f}".rstrip('0').rstrip('.') if item['price_stars'] % 1 else str(int(item['price_stars']))
-        item_total_rub = f"{item['total_rub']:.2f}".rstrip('0').rstrip('.') if item['total_rub'] % 1 else str(int(item['total_rub']))
-        item_total_stars = f"{item['total_stars']:.2f}".rstrip('0').rstrip('.') if item['total_stars'] % 1 else str(int(item['total_stars']))
+        rub_price = format_price(item['price_rub'])
+        stars_price = format_price(item['price_stars'])
+        item_total_rub = format_price(item['total_rub'])
+        item_total_stars = format_price(item['total_stars'])
         
         cart_text += f"• *{item['name']}* x{item['quantity']}\n"
         cart_text += f"  {rub_price}₽ x{item['quantity']} = {item_total_rub}₽\n"
         cart_text += f"  {stars_price}⭐ x{item['quantity']} = {item_total_stars}⭐\n\n"
     
     if cart.discount > 0:
-        original_rub_str = f"{original_rub:.2f}".rstrip('0').rstrip('.') if original_rub % 1 else str(int(original_rub))
-        original_stars_str = f"{original_stars:.2f}".rstrip('0').rstrip('.') if original_stars % 1 else str(int(original_stars))
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        original_rub_str = format_price(original_rub)
+        original_stars_str = format_price(original_stars)
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         
         cart_text += f"*Скидка по промокоду* `{cart.promocode}`: {cart.discount}%\n"
         cart_text += f"*Было:* {original_rub_str}₽ / {original_stars_str}⭐\n"
         cart_text += f"*Стало:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     else:
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         cart_text += f"*Итого:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     
     await message.answer(
@@ -969,10 +1237,19 @@ async def show_my_orders_menu(message: Message):
     if is_group_chat(message):
         return
     
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔄 Активные заказы")],
+            [KeyboardButton(text="✅ Завершенные заказы")],
+            [KeyboardButton(text="🔙 На главную")]
+        ],
+        resize_keyboard=True
+    )
+    
     await message.answer(
         "📦 *Ваши заказы*\n\nВыберите категорию:",
         parse_mode="Markdown",
-        reply_markup=get_my_orders_keyboard()
+        reply_markup=keyboard
     )
 
 @dp.message(F.text == "🔄 Активные заказы")
@@ -1005,8 +1282,8 @@ async def show_active_orders(message: Message):
         
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"{status_emoji} *Заказ #{order.order_id}*\n"
@@ -1043,8 +1320,8 @@ async def show_completed_orders(message: Message):
     for order in completed_orders[:5]:
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"🎉 *Заказ #{order.order_id}*\n"
@@ -1190,18 +1467,27 @@ async def process_promocode(message: Message, state: FSMContext):
         return
     
     code = message.text.strip().upper()
-    valid, discount, msg = db.validate_promocode(code)
+    cart = db.get_cart(message.from_user.id)
+    
+    # Вычисляем текущую сумму корзины
+    cart_total = 0.0
+    cart_products = []
+    for product_id, quantity in cart.items.items():
+        product = db.get_product(product_id)
+        if product:
+            cart_total += product.price_rub * quantity
+            cart_products.append(product_id)
+    
+    valid, discount, msg = db.validate_promocode(code, cart_total, cart_products)
     
     if valid:
-        cart = db.get_cart(message.from_user.id)
         cart.promocode = code
         cart.discount = discount
         db.use_promocode(code)
         
-        response = f"✅ Промокод применен! Скидка {discount}%\n\n"
-        
         await message.answer(
-            response,
+            f"✅ {msg}\n\n"
+            f"Скидка {discount}% применена к вашей корзине!",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(is_admin(message.from_user.id))
         )
@@ -1252,19 +1538,19 @@ async def show_receipt(callback: CallbackQuery):
     for product_id, quantity in order.items.items():
         product = db.get_product(product_id)
         if product:
-            rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.')
-            stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.')
+            rub_price = format_price(product.price_rub)
+            stars_price = format_price(product.price_stars)
             receipt_text += f"• {product.name} x{quantity}\n"
-            receipt_text += f"  {rub_price}₽ x{quantity} = {product.price_rub * quantity:.2f}₽\n"
-            receipt_text += f"  {stars_price}⭐ x{quantity} = {product.price_stars * quantity:.2f}⭐\n"
+            receipt_text += f"  {rub_price}₽ x{quantity} = {format_price(product.price_rub * quantity)}₽\n"
+            receipt_text += f"  {stars_price}⭐ x{quantity} = {format_price(product.price_stars * quantity)}⭐\n"
     
     receipt_text += "\n" + "=" * 30 + "\n"
     
     if order.promocode_used:
         receipt_text += f"🏷 *Промокод:* {order.promocode_used}\n"
     
-    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.')
-    total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.')
+    total_rub_str = format_price(order.total_rub)
+    total_stars_str = format_price(order.total_stars)
     
     receipt_text += f"💳 *Способ оплаты:* {'⭐ Звезды' if order.payment_method == PaymentMethod.STARS else '💳 Рубли'}\n"
     receipt_text += f"💰 *ИТОГО:* {total_rub_str}₽ / {total_stars_str}⭐\n"
@@ -1319,28 +1605,11 @@ async def view_contest(callback: CallbackQuery):
         await callback.answer("Конкурс не найден или уже завершен", show_alert=True)
         return
     
-    # Проверяем требование покупки
-    if contest.required_purchase:
-        has_purchased = db.check_purchase_requirement(contest_id, callback.from_user.id)
-        if not has_purchased:
-            product = db.get_product(contest.required_product_id) if contest.required_product_id else None
-            product_text = f"товар \"{product.name}\"" if product else "необходимый товар"
-            
-            await callback.message.answer(
-                f"❌ Для участия в этом конкурсе необходимо приобрести {product_text}.\n\n"
-                f"После покупки вы сможете участвовать в конкурсе автоматически.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="🛍 Перейти в каталог", callback_data="back_to_catalog")],
-                        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_contests")]
-                    ]
-                )
-            )
-            await callback.answer()
-            return
+    # Проверяем требования к покупкам
+    passed, message = contest.check_purchase_requirements(callback.from_user.id, db)
     
     # Проверяем, участвовал ли уже пользователь
-    has_participated = db.has_participated_in_contest(contest_id, callback.from_user.id)
+    has_participated = contest.has_participated(callback.from_user.id)
     
     end_date = contest.end_date.strftime('%d.%m.%Y %H:%M')
     remaining = contest.end_date - datetime.now()
@@ -1350,22 +1619,37 @@ async def view_contest(callback: CallbackQuery):
     contest_text = (
         f"🎁 *{contest.name}*\n\n"
         f"{contest.description}\n\n"
-        f"🏆 *Приз:* {contest.prize}\n"
-        f"📅 *Окончание:* {end_date}\n"
-        f"⏰ *Осталось:* {days} д. {hours} ч.\n"
-        f"👥 *Участников:* {len(contest.participants)}\n"
+        f"🏆 *Призы:*\n"
     )
     
-    if contest.required_purchase:
-        product = db.get_product(contest.required_product_id) if contest.required_product_id else None
-        if product:
-            contest_text += f"📦 *Требуется покупка:* {product.name}\n"
+    for i, prize in enumerate(contest.prizes, 1):
+        contest_text += f"  {i}. {prize.description}\n"
+    
+    contest_text += f"\n📅 *Окончание:* {end_date}\n"
+    contest_text += f"⏰ *Осталось:* {days} д. {hours} ч.\n"
+    contest_text += f"👥 *Участников:* {len(contest.participants)}"
+    
+    if contest.max_participants > 0:
+        contest_text += f"/{contest.max_participants}"
+    
+    if contest.required_products:
+        contest_text += f"\n📦 *Требуемые товары:*\n"
+        for prod_id in contest.required_products:
+            product = db.get_product(prod_id)
+            if product:
+                contest_text += f"  • {product.name}\n"
+    
+    if contest.min_purchase_amount > 0:
+        contest_text += f"\n💰 *Минимальная сумма покупки:* {format_price(contest.min_purchase_amount)}₽"
+    
+    if not passed:
+        contest_text += f"\n\n⚠️ *Требования не выполнены:*\n{message}"
+    elif has_participated:
+        contest_text += f"\n\n✅ *Вы уже участвуете в конкурсе!*"
     
     keyboard = InlineKeyboardBuilder()
     
-    if has_participated:
-        keyboard.row(InlineKeyboardButton(text="✅ Вы уже участвуете", callback_data="noop"))
-    else:
+    if passed and not has_participated:
         keyboard.row(InlineKeyboardButton(text="🎲 Участвовать", callback_data=f"participate_{contest_id}"))
     
     keyboard.row(InlineKeyboardButton(text="◀️ Назад к конкурсам", callback_data="back_to_contests"))
@@ -1380,32 +1664,14 @@ async def view_contest(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("participate_"))
 async def participate_in_contest(callback: CallbackQuery):
     contest_id = callback.data.split("_")[1]
-    contest = db.get_contest(contest_id)
     
-    if not contest or not contest.is_active():
-        await callback.answer("Конкурс не найден или уже завершен", show_alert=True)
-        return
+    success, message = db.participate_in_contest(contest_id, callback.from_user.id)
     
-    # Проверяем требование покупки
-    if contest.required_purchase:
-        has_purchased = db.check_purchase_requirement(contest_id, callback.from_user.id)
-        if not has_purchased:
-            product = db.get_product(contest.required_product_id) if contest.required_product_id else None
-            product_text = f"товар \"{product.name}\"" if product else "необходимый товар"
-            
-            await callback.answer(f"Для участия необходимо приобрести {product_text}", show_alert=True)
-            return
-    
-    if db.has_participated_in_contest(contest_id, callback.from_user.id):
-        await callback.answer("Вы уже участвуете в этом конкурсе!", show_alert=True)
-        return
-    
-    db.participate_in_contest(contest_id, callback.from_user.id)
-    
-    await callback.answer("✅ Вы успешно участвуете в конкурсе! Удачи!", show_alert=True)
-    
-    # Обновляем сообщение
-    await view_contest(callback)
+    if success:
+        await callback.answer("✅ Вы успешно участвуете в конкурсе! Удачи!", show_alert=True)
+        await view_contest(callback)
+    else:
+        await callback.answer(f"❌ {message}", show_alert=True)
 
 @dp.callback_query(F.data == "back_to_contests")
 async def back_to_contests(callback: CallbackQuery):
@@ -1425,7 +1691,20 @@ async def back_to_contests(callback: CallbackQuery):
         )
     await callback.answer()
 
-# ==================== АДМИН-ПАНЕЛЬ КОНКУРСОВ ====================
+# ==================== СОЗДАНИЕ КОНКУРСОВ (АДМИН) ====================
+
+class ContestCreationState:
+    def __init__(self):
+        self.name = None
+        self.description = None
+        self.prizes = []
+        self.days = 7
+        self.winners_count = 1
+        self.max_participants = 0
+        self.required_products = []
+        self.min_purchase_amount = 0.0
+        self.current_prize_type = None
+        self.current_prize_value = None
 
 @dp.message(F.text == "🎁 Управление конкурсами")
 async def manage_contests(message: Message):
@@ -1440,18 +1719,21 @@ async def manage_contests(message: Message):
     )
 
 @dp.callback_query(F.data == "create_contest")
-async def create_contest_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Нет прав")
+async def create_contest_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
         return
     
     await state.set_state(AdminStates.waiting_for_contest_name)
-    await message.answer(
+    await state.update_data(contest_creation=ContestCreationState())
+    
+    await callback.message.answer(
         "Введите название конкурса:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
         )
     )
+    await callback.answer()
 
 @dp.message(AdminStates.waiting_for_contest_name)
 async def create_contest_name(message: Message, state: FSMContext):
@@ -1463,7 +1745,11 @@ async def create_contest_name(message: Message, state: FSMContext):
         )
         return
     
-    await state.update_data(contest_name=message.text)
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    creation.name = message.text
+    await state.update_data(contest_creation=creation)
+    
     await state.set_state(AdminStates.waiting_for_contest_description)
     await message.answer(
         "Введите описание конкурса:",
@@ -1482,17 +1768,136 @@ async def create_contest_description(message: Message, state: FSMContext):
         )
         return
     
-    await state.update_data(contest_description=message.text)
-    await state.set_state(AdminStates.waiting_for_contest_prize)
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    creation.description = message.text
+    await state.update_data(contest_creation=creation)
+    
+    await state.set_state(AdminStates.waiting_for_contest_prize_type)
     await message.answer(
-        "Введите приз конкурса:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
-        )
+        "🎁 *Добавление призов*\n\n"
+        "Выберите тип приза:",
+        parse_mode="Markdown",
+        reply_markup=get_prize_type_keyboard()
     )
 
-@dp.message(AdminStates.waiting_for_contest_prize)
-async def create_contest_prize(message: Message, state: FSMContext):
+@dp.callback_query(F.data.startswith("prize_type_"))
+async def add_prize_type(callback: CallbackQuery, state: FSMContext):
+    prize_type_str = callback.data.split("_")[2]
+    
+    prize_type_map = {
+        "discount": PrizeType.DISCOUNT_PROMOCODE,
+        "product": PrizeType.FREE_PRODUCT,
+        "cash": PrizeType.CASH_REWARD,
+        "stars": PrizeType.STARS_REWARD,
+        "custom": PrizeType.CUSTOM_PRIZE,
+        "coupon": PrizeType.COUPON,
+        "mystery": PrizeType.MYSTERY_BOX
+    }
+    
+    prize_type = prize_type_map.get(prize_type_str)
+    if not prize_type:
+        await callback.answer("Неизвестный тип приза")
+        return
+    
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    creation.current_prize_type = prize_type
+    
+    await state.update_data(contest_creation=creation)
+    
+    if prize_type == PrizeType.DISCOUNT_PROMOCODE:
+        await state.set_state(AdminStates.waiting_for_contest_prize_value)
+        await callback.message.answer(
+            "Введите процент скидки для промокода (1-100):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    elif prize_type == PrizeType.FREE_PRODUCT:
+        await state.set_state(AdminStates.waiting_for_contest_prize_value)
+        
+        products = db.get_all_products()
+        if not products:
+            await callback.message.answer(
+                "❌ Нет доступных товаров. Сначала добавьте товары.",
+                reply_markup=get_admin_keyboard()
+            )
+            await state.clear()
+            await callback.answer()
+            return
+        
+        builder = InlineKeyboardBuilder()
+        for product in products:
+            builder.row(InlineKeyboardButton(
+                text=f"{product.name} - {format_price(product.price_rub)}₽",
+                callback_data=f"select_product_prize_{product.id}"
+            ))
+        builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+        
+        await callback.message.edit_text(
+            "Выберите товар для приза:",
+            reply_markup=builder.as_markup()
+        )
+    elif prize_type in [PrizeType.CASH_REWARD, PrizeType.STARS_REWARD]:
+        await state.set_state(AdminStates.waiting_for_contest_prize_value)
+        unit = "₽" if prize_type == PrizeType.CASH_REWARD else "⭐"
+        await callback.message.answer(
+            f"Введите сумму приза в {unit}:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    elif prize_type == PrizeType.CUSTOM_PRIZE:
+        await state.set_state(AdminStates.waiting_for_contest_prize_description)
+        await callback.message.answer(
+            "Введите описание индивидуального приза:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    elif prize_type == PrizeType.COUPON:
+        await state.set_state(AdminStates.waiting_for_contest_prize_value)
+        await callback.message.answer(
+            "Введите описание купона:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    elif prize_type == PrizeType.MYSTERY_BOX:
+        await state.set_state(AdminStates.waiting_for_contest_prize_description)
+        await callback.message.answer(
+            "Введите описание секретного приза:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("select_product_prize_"))
+async def select_product_prize(callback: CallbackQuery, state: FSMContext):
+    product_id = callback.data.split("_")[3]
+    
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    
+    prize = Prize(PrizeType.FREE_PRODUCT, product_id, None)
+    creation.prizes.append(prize)
+    creation.current_prize_type = None
+    
+    await state.update_data(contest_creation=creation)
+    
+    await callback.message.answer(
+        f"✅ Приз добавлен!\n\n"
+        f"Текущие призы: {len(creation.prizes)}\n\n"
+        f"Выберите следующий тип приза или завершите добавление:",
+        reply_markup=get_prize_type_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_contest_prize_value)
+async def create_contest_prize_value(message: Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
@@ -1501,14 +1906,103 @@ async def create_contest_prize(message: Message, state: FSMContext):
         )
         return
     
-    await state.update_data(contest_prize=message.text)
-    await state.set_state(AdminStates.waiting_for_contest_days)
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    
+    try:
+        if creation.current_prize_type == PrizeType.DISCOUNT_PROMOCODE:
+            value = int(message.text)
+            if value < 1 or value > 100:
+                raise ValueError
+        elif creation.current_prize_type in [PrizeType.CASH_REWARD, PrizeType.STARS_REWARD]:
+            value = float(message.text.replace(',', '.'))
+            if value <= 0:
+                raise ValueError
+        else:
+            value = message.text
+        
+        prize = Prize(creation.current_prize_type, value, None)
+        creation.prizes.append(prize)
+        creation.current_prize_type = None
+        
+        await state.update_data(contest_creation=creation)
+        
+        await message.answer(
+            f"✅ Приз добавлен!\n\n"
+            f"Текущие призы: {len(creation.prizes)}\n\n"
+            f"Выберите следующий тип приза или завершите добавление:",
+            reply_markup=get_prize_type_keyboard()
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Неверное значение. Попробуйте снова:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.message(AdminStates.waiting_for_contest_prize_description)
+async def create_contest_prize_description(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    
+    prize = Prize(creation.current_prize_type, message.text, message.text)
+    creation.prizes.append(prize)
+    creation.current_prize_type = None
+    
+    await state.update_data(contest_creation=creation)
+    
     await message.answer(
-        "Введите количество дней действия конкурса:",
+        f"✅ Приз добавлен!\n\n"
+        f"Текущие призы: {len(creation.prizes)}\n\n"
+        f"Выберите следующий тип приза или завершите добавление:",
+        reply_markup=get_prize_type_keyboard()
+    )
+
+@dp.callback_query(F.data == "prize_done")
+async def finish_adding_prizes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    creation = data.get('contest_creation')
+    
+    if not creation.prizes:
+        await callback.answer("Добавьте хотя бы один приз!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_contest_days)
+    await callback.message.answer(
+        "Введите количество дней действия конкурса (по умолчанию 7):\n\n"
+        "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏩ Пропустить (7 дней)", callback_data="skip_days")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
         )
     )
+    await callback.answer()
+
+@dp.callback_query(F.data == "skip_days")
+async def skip_days(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_contest_winners_count)
+    await callback.message.answer(
+        "Введите количество победителей (по умолчанию 1):\n\n"
+        "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏩ Пропустить (1 победитель)", callback_data="skip_winners")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
+        )
+    )
+    await callback.answer()
 
 @dp.message(AdminStates.waiting_for_contest_days)
 async def create_contest_days(message: Message, state: FSMContext):
@@ -1525,112 +2019,332 @@ async def create_contest_days(message: Message, state: FSMContext):
         if days < 1:
             raise ValueError
         
-        await state.update_data(contest_days=days)
-        await state.set_state(AdminStates.waiting_for_contest_required_purchase)
+        data = await state.get_data()
+        creation = data.get('contest_creation')
+        creation.days = days
+        await state.update_data(contest_creation=creation)
         
-        keyboard = InlineKeyboardMarkup(
+        await state.set_state(AdminStates.waiting_for_contest_winners_count)
+        await message.answer(
+            "Введите количество победителей (по умолчанию 1):\n\n"
+            "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⏩ Пропустить (1 победитель)", callback_data="skip_winners")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+                ]
+            )
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число дней",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.callback_query(F.data == "skip_winners")
+async def skip_winners(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_contest_max_participants)
+    await callback.message.answer(
+        "Введите максимальное количество участников (0 - без ограничений):\n\n"
+        "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Да", callback_data="req_purchase_yes")],
-                [InlineKeyboardButton(text="❌ Нет", callback_data="req_purchase_no")],
+                [InlineKeyboardButton(text="⏩ Пропустить (без ограничений)", callback_data="skip_max_participants")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
             ]
         )
-        
-        await message.answer(
-            "Требуется ли обязательная покупка для участия?",
-            reply_markup=keyboard
-        )
-    except ValueError:
-        await message.answer("❌ Введите корректное число дней")
+    )
+    await callback.answer()
 
-@dp.callback_query(F.data.startswith("req_purchase_"))
-async def create_contest_required_purchase(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав")
+@dp.message(AdminStates.waiting_for_contest_winners_count)
+async def create_contest_winners_count(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
         return
     
-    required = callback.data == "req_purchase_yes"
-    await state.update_data(contest_required_purchase=required)
-    
-    if required:
-        await state.set_state(AdminStates.waiting_for_contest_required_product)
+    try:
+        winners_count = int(message.text)
+        if winners_count < 1:
+            raise ValueError
         
-        products = db.get_all_products()
-        if not products:
-            await callback.message.answer(
-                "❌ Нет доступных товаров. Сначала добавьте товары.",
-                reply_markup=get_admin_keyboard()
+        data = await state.get_data()
+        creation = data.get('contest_creation')
+        creation.winners_count = winners_count
+        await state.update_data(contest_creation=creation)
+        
+        await state.set_state(AdminStates.waiting_for_contest_max_participants)
+        await message.answer(
+            "Введите максимальное количество участников (0 - без ограничений):\n\n"
+            "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⏩ Пропустить (без ограничений)", callback_data="skip_max_participants")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+                ]
             )
-            await state.clear()
-            await callback.answer()
-            return
-        
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.callback_query(F.data == "skip_max_participants")
+async def skip_max_participants(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_contest_required_products)
+    
+    products = db.get_all_products()
+    if products:
         builder = InlineKeyboardBuilder()
         for product in products:
             builder.row(InlineKeyboardButton(
-                text=f"{product.name} - {product.price_rub}₽",
-                callback_data=f"req_product_{product.id}"
+                text=f"📦 {product.name} - {format_price(product.price_rub)}₽",
+                callback_data=f"add_required_product_{product.id}"
             ))
+        builder.row(InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_required_products"))
         builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
         
-        await callback.message.edit_text(
-            "Выберите товар, который нужно купить для участия:",
+        await callback.message.answer(
+            "Выберите товары, которые необходимо купить для участия в конкурсе\n"
+            "(можно выбрать несколько, нажимая на кнопки):\n\n"
+            "После выбора нажмите 'Завершить выбор'.",
             reply_markup=builder.as_markup()
         )
     else:
-        contest = db.add_contest(
-            (await state.get_data())['contest_name'],
-            (await state.get_data())['contest_description'],
-            (await state.get_data())['contest_prize'],
-            False,
-            None,
-            (await state.get_data())['contest_days']
+        await callback.message.answer(
+            "Нет доступных товаров для выбора обязательных.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Продолжить без требований", callback_data="no_required_products")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+                ]
+            )
         )
-        
-        await callback.message.edit_text(
-            f"✅ Конкурс \"{contest.name}\" успешно создан!\n\n"
-            f"📅 Длительность: {contest.end_date.strftime('%d.%m.%Y')}\n"
-            f"🏆 Приз: {contest.prize}\n"
-            f"🎲 Участники смогут участвовать сразу."
-        )
-        await state.clear()
-    
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("req_product_"))
-async def create_contest_required_product(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав")
+@dp.message(AdminStates.waiting_for_contest_max_participants)
+async def create_contest_max_participants(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
         return
     
-    product_id = callback.data.split("_")[2]
+    try:
+        max_participants = int(message.text)
+        if max_participants < 0:
+            raise ValueError
+        
+        data = await state.get_data()
+        creation = data.get('contest_creation')
+        creation.max_participants = max_participants
+        await state.update_data(contest_creation=creation)
+        
+        await state.set_state(AdminStates.waiting_for_contest_required_products)
+        
+        products = db.get_all_products()
+        if products:
+            builder = InlineKeyboardBuilder()
+            for product in products:
+                builder.row(InlineKeyboardButton(
+                    text=f"📦 {product.name} - {format_price(product.price_rub)}₽",
+                    callback_data=f"add_required_product_{product.id}"
+                ))
+            builder.row(InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_required_products"))
+            builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+            
+            await message.answer(
+                "Выберите товары, которые необходимо купить для участия в конкурсе\n"
+                "(можно выбрать несколько, нажимая на кнопки):\n\n"
+                "После выбора нажмите 'Завершить выбор'.",
+                reply_markup=builder.as_markup()
+            )
+        else:
+            await message.answer(
+                "Нет доступных товаров для выбора обязательных.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Продолжить без требований", callback_data="no_required_products")],
+                        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+                    ]
+                )
+            )
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.callback_query(F.data.startswith("add_required_product_"))
+async def add_required_product(callback: CallbackQuery, state: FSMContext):
+    product_id = callback.data.split("_")[3]
+    
     data = await state.get_data()
+    creation = data.get('contest_creation')
+    
+    if product_id not in creation.required_products:
+        creation.required_products.append(product_id)
+        await state.update_data(contest_creation=creation)
+        
+        product = db.get_product(product_id)
+        await callback.answer(f"✅ {product.name} добавлен в обязательные товары")
+    else:
+        await callback.answer("Этот товар уже добавлен")
+    
+    # Обновляем клавиатуру
+    products = db.get_all_products()
+    builder = InlineKeyboardBuilder()
+    for product in products:
+        status = "✅ " if product.id in creation.required_products else "📦 "
+        builder.row(InlineKeyboardButton(
+            text=f"{status}{product.name} - {format_price(product.price_rub)}₽",
+            callback_data=f"add_required_product_{product.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_required_products"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "finish_required_products")
+async def finish_required_products(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_contest_min_amount)
+    await callback.message.answer(
+        "Введите минимальную сумму покупки для участия в конкурсе (0 - без ограничений):\n\n"
+        "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏩ Пропустить (без ограничений)", callback_data="skip_min_amount")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
+        )
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "no_required_products")
+async def no_required_products(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_contest_min_amount)
+    await callback.message.answer(
+        "Введите минимальную сумму покупки для участия в конкурсе (0 - без ограничений):\n\n"
+        "Отправьте число или нажмите 'Пропустить' для значения по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏩ Пропустить (без ограничений)", callback_data="skip_min_amount")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
+        )
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "skip_min_amount")
+async def skip_min_amount(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    creation = data.get('contest_creation')
     
     contest = db.add_contest(
-        data['contest_name'],
-        data['contest_description'],
-        data['contest_prize'],
-        True,
-        product_id,
-        data['contest_days']
+        name=creation.name,
+        description=creation.description,
+        prizes=creation.prizes,
+        required_products=creation.required_products,
+        min_purchase_amount=creation.min_purchase_amount,
+        max_participants=creation.max_participants,
+        days_valid=creation.days,
+        winners_count=creation.winners_count
     )
     
-    product = db.get_product(product_id)
+    contest.status = ContestStatus.ACTIVE
     
     await callback.message.edit_text(
-        f"✅ Конкурс \"{contest.name}\" успешно создан!\n\n"
-        f"📅 Длительность: {contest.end_date.strftime('%d.%m.%Y')}\n"
-        f"🏆 Приз: {contest.prize}\n"
-        f"📦 Требуется покупка: {product.name if product else 'Неизвестный товар'}\n\n"
-        f"Пользователи смогут участвовать только после покупки этого товара."
+        f"✅ *Конкурс создан и активирован!*\n\n"
+        f"🎁 Название: {contest.name}\n"
+        f"🏆 Призов: {len(contest.prizes)}\n"
+        f"👥 Макс. участников: {contest.max_participants if contest.max_participants > 0 else 'Без ограничений'}\n"
+        f"🎲 Победителей: {contest.winners_count}\n"
+        f"📦 Обязательные товары: {len(contest.required_products)}\n"
+        f"💰 Мин. сумма покупки: {format_price(contest.min_purchase_amount) if contest.min_purchase_amount > 0 else 'Без ограничений'}₽\n"
+        f"📅 Длительность: {creation.days} дней\n\n"
+        f"Конкурс доступен для участия!",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
     )
+    
     await state.clear()
     await callback.answer()
+
+@dp.message(AdminStates.waiting_for_contest_min_amount)
+async def create_contest_min_amount(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        min_amount = float(message.text.replace(',', '.'))
+        if min_amount < 0:
+            raise ValueError
+        
+        data = await state.get_data()
+        creation = data.get('contest_creation')
+        creation.min_purchase_amount = min_amount
+        await state.update_data(contest_creation=creation)
+        
+        contest = db.add_contest(
+            name=creation.name,
+            description=creation.description,
+            prizes=creation.prizes,
+            required_products=creation.required_products,
+            min_purchase_amount=min_amount,
+            max_participants=creation.max_participants,
+            days_valid=creation.days,
+            winners_count=creation.winners_count
+        )
+        
+        contest.status = ContestStatus.ACTIVE
+        
+        await message.answer(
+            f"✅ *Конкурс создан и активирован!*\n\n"
+            f"🎁 Название: {contest.name}\n"
+            f"🏆 Призов: {len(contest.prizes)}\n"
+            f"👥 Макс. участников: {contest.max_participants if contest.max_participants > 0 else 'Без ограничений'}\n"
+            f"🎲 Победителей: {contest.winners_count}\n"
+            f"📦 Обязательные товары: {len(contest.required_products)}\n"
+            f"💰 Мин. сумма покупки: {format_price(min_amount) if min_amount > 0 else 'Без ограничений'}₽\n"
+            f"📅 Длительность: {creation.days} дней\n\n"
+            f"Конкурс доступен для участия!",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+# ==================== УПРАВЛЕНИЕ КОНКУРСАМИ (АДМИН) ====================
 
 @dp.callback_query(F.data.startswith("admin_contest_"))
 async def admin_view_contest(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав")
+        await callback.answer("Нет прав", show_alert=True)
         return
     
     contest_id = callback.data.split("_")[2]
@@ -1640,41 +2354,103 @@ async def admin_view_contest(callback: CallbackQuery):
         await callback.answer("Конкурс не найден", show_alert=True)
         return
     
-    status_text = "🟢 Активен" if contest.is_active() else "🔴 Завершен"
+    status_emoji = {
+        ContestStatus.DRAFT: "📝",
+        ContestStatus.ACTIVE: "🟢",
+        ContestStatus.ENDED: "🔴",
+        ContestStatus.CANCELLED: "⚫"
+    }.get(contest.status, "❓")
+    
+    status_text = {
+        ContestStatus.DRAFT: "Черновик",
+        ContestStatus.ACTIVE: "Активен",
+        ContestStatus.ENDED: "Завершен",
+        ContestStatus.CANCELLED: "Отменен"
+    }.get(contest.status, "Неизвестно")
     
     text = (
-        f"🎁 *{contest.name}*\n\n"
+        f"{status_emoji} *{contest.name}*\n\n"
         f"📝 {contest.description}\n\n"
-        f"🏆 *Приз:* {contest.prize}\n"
-        f"📊 *Статус:* {status_text}\n"
-        f"📅 *Создан:* {contest.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-        f"📅 *Окончание:* {contest.end_date.strftime('%d.%m.%Y %H:%M')}\n"
-        f"👥 *Участников:* {len(contest.participants)}\n"
+        f"🏆 *Призы:*\n"
     )
     
-    if contest.required_purchase:
-        product = db.get_product(contest.required_product_id) if contest.required_product_id else None
-        text += f"📦 *Требуется покупка:* {product.name if product else 'Неизвестный товар'}\n"
+    for i, prize in enumerate(contest.prizes, 1):
+        text += f"  {i}. {prize.description}\n"
     
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Завершить конкурс", callback_data=f"end_contest_{contest_id}")] if contest.is_active() else [],
-            [InlineKeyboardButton(text="🗑 Удалить конкурс", callback_data=f"delete_contest_{contest_id}")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_contests_admin")]
-        ]
-    )
+    text += f"\n📊 *Статус:* {status_text}\n"
+    text += f"📅 *Создан:* {contest.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+    text += f"📅 *Окончание:* {contest.end_date.strftime('%d.%m.%Y %H:%M')}\n"
+    text += f"👥 *Участников:* {len(contest.participants)}"
     
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    if contest.max_participants > 0:
+        text += f"/{contest.max_participants}"
+    
+    text += f"\n🎲 *Победителей:* {contest.winners_count}\n"
+    
+    if contest.required_products:
+        text += f"\n📦 *Обязательные товары:*\n"
+        for prod_id in contest.required_products:
+            product = db.get_product(prod_id)
+            if product:
+                text += f"  • {product.name}\n"
+    
+    if contest.min_purchase_amount > 0:
+        text += f"\n💰 *Мин. сумма покупки:* {format_price(contest.min_purchase_amount)}₽"
+    
+    if contest.winners:
+        text += f"\n\n🏆 *Победители:*\n"
+        for winner_id, prize in contest.winners:
+            user = await bot.get_chat(winner_id)
+            username = user.username or str(winner_id)
+            text += f"  • @{username} - {prize.description}\n"
+    
+    keyboard_buttons = []
+    
+    if contest.status == ContestStatus.DRAFT:
+        keyboard_buttons.append([InlineKeyboardButton(text="✅ Активировать", callback_data=f"activate_contest_{contest_id}")])
+    elif contest.status == ContestStatus.ACTIVE:
+        keyboard_buttons.append([InlineKeyboardButton(text="⏹️ Завершить досрочно", callback_data=f"end_contest_{contest_id}")])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="🎲 Выбрать победителей", callback_data=f"select_winners_{contest_id}")])
+    keyboard_buttons.append([InlineKeyboardButton(text="🗑 Удалить конкурс", callback_data=f"delete_contest_{contest_id}")])
+    keyboard_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_contests_admin")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    except TelegramBadRequest:
+        await callback.message.delete()
+        await callback.message.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("activate_contest_"))
+async def activate_contest(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    contest_id = callback.data.split("_")[2]
+    contest = db.get_contest(contest_id)
+    
+    if contest:
+        contest.status = ContestStatus.ACTIVE
+        await callback.message.edit_text(f"✅ Конкурс \"{contest.name}\" активирован!")
+    
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("end_contest_"))
-async def end_contest(callback: CallbackQuery):
+async def end_contest_early(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав")
+        await callback.answer("Нет прав", show_alert=True)
         return
     
     contest_id = callback.data.split("_")[2]
@@ -1682,19 +2458,55 @@ async def end_contest(callback: CallbackQuery):
     
     if contest:
         contest.status = ContestStatus.ENDED
-        
-        await callback.message.edit_text(
-            f"✅ Конкурс \"{contest.name}\" завершен!\n\n"
-            f"Участников: {len(contest.participants)}\n"
-            f"Победители будут объявлены отдельно."
-        )
+        await callback.message.edit_text(f"⏹️ Конкурс \"{contest.name}\" завершен досрочно!")
     
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("select_winners_"))
+async def select_winners(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    contest_id = callback.data.split("_")[2]
+    contest = db.get_contest(contest_id)
+    
+    if not contest:
+        await callback.answer("Конкурс не найден", show_alert=True)
+        return
+    
+    if not contest.participants:
+        await callback.answer("Нет участников для выбора победителей!", show_alert=True)
+        return
+    
+    winners = contest.select_winners()
+    
+    text = f"🏆 *Победители конкурса \"{contest.name}\":*\n\n"
+    
+    for winner_id, prize in winners:
+        try:
+            user = await bot.get_chat(winner_id)
+            username = user.username or str(winner_id)
+            text += f"• @{username} - {prize.description}\n"
+            
+            await bot.send_message(
+                winner_id,
+                f"🎉 *Поздравляем! Вы выиграли в конкурсе \"{contest.name}\"!*\n\n"
+                f"Ваш приз: {prize.description}\n\n"
+                f"Для получения приза обратитесь к администратору.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify winner {winner_id}: {e}")
+            text += f"• Пользователь ID:{winner_id} - {prize.description} (не удалось уведомить)\n"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("delete_contest_"))
 async def delete_contest(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав")
+        await callback.answer("Нет прав", show_alert=True)
         return
     
     contest_id = callback.data.split("_")[2]
@@ -1708,6 +2520,10 @@ async def delete_contest(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_contests_admin")
 async def back_to_contests_admin(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
     await callback.message.edit_text(
         "🎁 *Управление конкурсами*\n\n"
         "Выберите действие:",
@@ -1723,11 +2539,20 @@ async def reviews_menu(message: Message):
     if is_group_chat(message):
         return
     
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Написать отзыв")],
+            [KeyboardButton(text="📖 Все отзывы")],
+            [KeyboardButton(text="🔙 На главную")]
+        ],
+        resize_keyboard=True
+    )
+    
     await message.answer(
         "⭐ *Раздел отзывов*\n\n"
         "Здесь вы можете оставить отзыв о покупке или прочитать отзывы других покупателей.",
         parse_mode="Markdown",
-        reply_markup=get_reviews_keyboard()
+        reply_markup=keyboard
     )
 
 @dp.message(F.text == "📝 Написать отзыв")
@@ -1889,6 +2714,17 @@ async def save_review(user_id: int, username: str, order_id: str, rating: int, c
         parse_mode="Markdown",
         reply_markup=get_reviews_keyboard()
     )
+
+def get_reviews_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Написать отзыв")],
+            [KeyboardButton(text="📖 Все отзывы")],
+            [KeyboardButton(text="🔙 На главную")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 @dp.message(F.text == "📖 Все отзывы")
 async def show_all_reviews(message: Message):
@@ -2068,8 +2904,8 @@ async def show_product(callback: CallbackQuery):
         await callback.answer("Товар не найден", show_alert=True)
         return
     
-    rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-    stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+    rub_price = format_price(product.price_rub)
+    stars_price = format_price(product.price_stars)
     
     text = (
         f"*{product.name}*\n\n"
@@ -2132,8 +2968,8 @@ async def increase_quantity(callback: CallbackQuery):
     if current_qty < product.stock:
         current_qty += 1
     
-    rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-    stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+    rub_price = format_price(product.price_rub)
+    stars_price = format_price(product.price_stars)
     
     text = (
         f"*{product.name}*\n\n"
@@ -2177,8 +3013,8 @@ async def decrease_quantity(callback: CallbackQuery):
     if current_qty > 1:
         current_qty -= 1
     
-    rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-    stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+    rub_price = format_price(product.price_rub)
+    stars_price = format_price(product.price_stars)
     
     text = (
         f"*{product.name}*\n\n"
@@ -2229,8 +3065,8 @@ async def cancel_manual_quantity(callback: CallbackQuery, state: FSMContext):
     product = db.get_product(product_id)
     
     if product:
-        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        rub_price = format_price(product.price_rub)
+        stars_price = format_price(product.price_stars)
         
         text = (
             f"*{product.name}*\n\n"
@@ -2277,8 +3113,8 @@ async def process_manual_quantity(message: Message, state: FSMContext):
             )
             return
         
-        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        rub_price = format_price(product.price_rub)
+        stars_price = format_price(product.price_stars)
         
         text = (
             f"*{product.name}*\n\n"
@@ -2382,26 +3218,26 @@ async def view_cart_from_catalog(callback: CallbackQuery):
         total_stars = total_stars * (100 - cart.discount) / 100
     
     for item in items_details:
-        rub_price = f"{item['price_rub']:.2f}".rstrip('0').rstrip('.') if item['price_rub'] % 1 else str(int(item['price_rub']))
-        stars_price = f"{item['price_stars']:.2f}".rstrip('0').rstrip('.') if item['price_stars'] % 1 else str(int(item['price_stars']))
-        item_total_rub = f"{item['total_rub']:.2f}".rstrip('0').rstrip('.') if item['total_rub'] % 1 else str(int(item['total_rub']))
-        item_total_stars = f"{item['total_stars']:.2f}".rstrip('0').rstrip('.') if item['total_stars'] % 1 else str(int(item['total_stars']))
+        rub_price = format_price(item['price_rub'])
+        stars_price = format_price(item['price_stars'])
+        item_total_rub = format_price(item['total_rub'])
+        item_total_stars = format_price(item['total_stars'])
         
         cart_text += f"• {item['name']} x{item['quantity']}\n"
         cart_text += f"  {rub_price}₽ x{item['quantity']} = {item_total_rub}₽\n"
         cart_text += f"  {stars_price}⭐ x{item['quantity']} = {item_total_stars}⭐\n\n"
     
     if cart.discount > 0:
-        original_rub_str = f"{original_rub:.2f}".rstrip('0').rstrip('.') if original_rub % 1 else str(int(original_rub))
-        original_stars_str = f"{original_stars:.2f}".rstrip('0').rstrip('.') if original_stars % 1 else str(int(original_stars))
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        original_rub_str = format_price(original_rub)
+        original_stars_str = format_price(original_stars)
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         
         cart_text += f"*Скидка:* {cart.discount}%\n"
         cart_text += f"*Итого со скидкой:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     else:
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         cart_text += f"*Итого:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     
     if cart.promocode:
@@ -2461,26 +3297,26 @@ async def remove_from_cart(callback: CallbackQuery):
         total_stars = total_stars * (100 - cart.discount) / 100
     
     for item in items_details:
-        rub_price = f"{item['price_rub']:.2f}".rstrip('0').rstrip('.') if item['price_rub'] % 1 else str(int(item['price_rub']))
-        stars_price = f"{item['price_stars']:.2f}".rstrip('0').rstrip('.') if item['price_stars'] % 1 else str(int(item['price_stars']))
-        item_total_rub = f"{item['total_rub']:.2f}".rstrip('0').rstrip('.') if item['total_rub'] % 1 else str(int(item['total_rub']))
-        item_total_stars = f"{item['total_stars']:.2f}".rstrip('0').rstrip('.') if item['total_stars'] % 1 else str(int(item['total_stars']))
+        rub_price = format_price(item['price_rub'])
+        stars_price = format_price(item['price_stars'])
+        item_total_rub = format_price(item['total_rub'])
+        item_total_stars = format_price(item['total_stars'])
         
         cart_text += f"• {item['name']} x{item['quantity']}\n"
         cart_text += f"  {rub_price}₽ x{item['quantity']} = {item_total_rub}₽\n"
         cart_text += f"  {stars_price}⭐ x{item['quantity']} = {item_total_stars}⭐\n\n"
     
     if cart.discount > 0:
-        original_rub_str = f"{original_rub:.2f}".rstrip('0').rstrip('.') if original_rub % 1 else str(int(original_rub))
-        original_stars_str = f"{original_stars:.2f}".rstrip('0').rstrip('.') if original_stars % 1 else str(int(original_stars))
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        original_rub_str = format_price(original_rub)
+        original_stars_str = format_price(original_stars)
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         
         cart_text += f"*Скидка:* {cart.discount}%\n"
         cart_text += f"*Итого со скидкой:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     else:
-        total_rub_str = f"{total_rub:.2f}".rstrip('0').rstrip('.') if total_rub % 1 else str(int(total_rub))
-        total_stars_str = f"{total_stars:.2f}".rstrip('0').rstrip('.') if total_stars % 1 else str(int(total_stars))
+        total_rub_str = format_price(total_rub)
+        total_stars_str = format_price(total_stars)
         cart_text += f"*Итого:* {total_rub_str}₽ / {total_stars_str}⭐\n"
     
     try:
@@ -2587,7 +3423,7 @@ async def pay_with_rubles(callback: CallbackQuery):
     
     payment_details = db.get_payment_details()
     
-    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+    total_rub_str = format_price(order.total_rub)
     
     text = (
         f"🧾 *Заказ #{order.order_id}*\n\n"
@@ -2674,7 +3510,7 @@ async def process_screenshot(message: Message, state: FSMContext):
         if product:
             items_text += f"• {product.name} x{quantity}\n"
     
-    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
+    total_rub_str = format_price(order.total_rub)
     
     admin_text = (
         f"📸 *Новый скрин оплаты!*\n\n"
@@ -2733,7 +3569,7 @@ async def successful_payment_handler(message: Message):
             if product:
                 items_text += f"• {product.name} x{quantity}\n"
         
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_stars_str = format_price(order.total_stars)
         
         receipt = (
             f"🧾 *ЧЕК #{order.order_id}*\n"
@@ -2778,6 +3614,10 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         "✅ Действие отменено.",
         reply_markup=get_main_keyboard(is_admin(callback.from_user.id))
     )
+    await callback.answer()
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
     await callback.answer()
 
 # ==================== ОБРАБОТЧИКИ АДМИНА ====================
@@ -3159,8 +3999,8 @@ async def add_product_stock(message: Message, state: FSMContext):
             stock
         )
         
-        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        rub_price = format_price(product.price_rub)
+        stars_price = format_price(product.price_stars)
         
         await message.answer(
             f"✅ Товар успешно добавлен!\n\n"
@@ -3281,8 +4121,8 @@ async def process_product_edit(message: Message, state: FSMContext):
         elif field == "stock":
             product.stock = int(value)
         
-        rub_price = f"{product.price_rub:.2f}".rstrip('0').rstrip('.') if product.price_rub % 1 else str(int(product.price_rub))
-        stars_price = f"{product.price_stars:.2f}".rstrip('0').rstrip('.') if product.price_stars % 1 else str(int(product.price_stars))
+        rub_price = format_price(product.price_rub)
+        stars_price = format_price(product.price_stars)
         
         await message.answer(
             f"✅ Товар обновлен!\n\n"
@@ -3453,13 +4293,74 @@ async def create_promocode_uses(message: Message, state: FSMContext):
         if uses < 1:
             raise ValueError
         
+        await state.update_data(promo_uses=uses)
+        await state.set_state(AdminStates.waiting_for_promocode_min_amount)
+        await message.answer(
+            "Введите минимальную сумму заказа для применения промокода (0 - без ограничений):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_min_amount_promo")],
+                                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректное число",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]
+            )
+        )
+
+@dp.callback_query(F.data == "skip_min_amount_promo")
+async def skip_min_amount_promo(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    promo = db.add_promocode(
+        data['promo_code'],
+        data['promo_discount'],
+        data['promo_days'],
+        data['promo_uses']
+    )
+    
+    await callback.message.edit_text(
+        f"✅ Промокод создан!\n\n"
+        f"Код: `{promo.code}`\n"
+        f"Скидка: {promo.discount_percent}%\n"
+        f"Действует: {promo.valid_until.strftime('%d.%m.%Y')}\n"
+        f"Использований: {promo.max_uses}",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+    await state.clear()
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_promocode_min_amount)
+async def create_promocode_min_amount(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        min_amount = float(message.text.replace(',', '.'))
+        if min_amount < 0:
+            raise ValueError
+        
         data = await state.get_data()
-        promo = db.add_promocode(data['promo_code'], data['promo_discount'], data['promo_days'], uses)
+        promo = db.add_promocode(
+            data['promo_code'],
+            data['promo_discount'],
+            data['promo_days'],
+            data['promo_uses'],
+            min_amount
+        )
         
         await message.answer(
             f"✅ Промокод создан!\n\n"
             f"Код: `{promo.code}`\n"
             f"Скидка: {promo.discount_percent}%\n"
+            f"Мин. сумма: {format_price(min_amount)}₽\n"
             f"Действует: {promo.valid_until.strftime('%d.%m.%Y')}\n"
             f"Использований: {promo.max_uses}",
             parse_mode="Markdown",
@@ -3560,35 +4461,24 @@ async def show_statistics(message: Message):
     if not is_admin(message.from_user.id) or is_group_chat(message):
         return
     
-    total_orders = len(db.orders)
-    pending_orders = len(db.get_pending_orders())
-    active_orders = len(db.get_active_orders())
-    completed_orders = len(db.get_completed_orders())
-    total_products = len(db.products)
-    total_users = len(set(o.user_id for o in db.orders.values()))
-    total_reviews = len(db.reviews)
-    active_contests = len(db.get_active_contests())
-    
-    total_revenue_rub = sum(o.total_rub for o in db.orders.values() if o.status == OrderStatus.COMPLETED)
-    total_revenue_stars = sum(o.total_stars for o in db.orders.values() if o.status == OrderStatus.COMPLETED)
-    
-    total_revenue_rub_str = f"{total_revenue_rub:.2f}".rstrip('0').rstrip('.') if total_revenue_rub % 1 else str(int(total_revenue_rub))
-    total_revenue_stars_str = f"{total_revenue_stars:.2f}".rstrip('0').rstrip('.') if total_revenue_stars % 1 else str(int(total_revenue_stars))
+    stats = db.get_stats()
     
     text = (
         f"📊 *Статистика магазина*\n\n"
-        f"📦 *Заказы:*\n"
-        f"  • Всего: {total_orders}\n"
-        f"  • Ожидают оплаты: {pending_orders}\n"
-        f"  • В обработке: {active_orders}\n"
-        f"  • Завершено: {completed_orders}\n\n"
+        f"👥 *Пользователи:* {stats['total_users']}\n"
+        f"📦 *Заказов:* {stats['total_orders']}\n"
+        f"  • Ожидают оплаты: {stats['pending_orders']}\n"
+        f"  • В обработке: {stats['active_orders']}\n"
+        f"  • Завершено: {stats['completed_orders']}\n\n"
         f"💰 *Выручка:*\n"
-        f"  • Рубли: {total_revenue_rub_str}₽\n"
-        f"  • Звезды: {total_revenue_stars_str}⭐\n\n"
-        f"👥 *Пользователи:* {total_users}\n"
-        f"🛍 *Товаров:* {total_products}\n"
-        f"⭐ *Отзывов:* {total_reviews}\n"
-        f"🎁 *Активных конкурсов:* {active_contests}"
+        f"  • Рубли: {format_price(stats['total_revenue_rub'])}₽\n"
+        f"  • Звезды: {format_price(stats['total_revenue_stars'])}⭐\n\n"
+        f"🛍 *Товаров:* {stats['total_products']}\n"
+        f"⭐ *Отзывов:* {stats['total_reviews']}\n"
+        f"🎁 *Конкурсов:*\n"
+        f"  • Всего: {stats['total_contests']}\n"
+        f"  • Активных: {stats['active_contests']}\n"
+        f"  • Участников: {stats['total_participants']}"
     )
     
     await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
@@ -3670,11 +4560,19 @@ async def view_ticket(callback: CallbackQuery):
         ]
     )
     
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    except TelegramBadRequest:
+        await callback.message.delete()
+        await callback.message.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("answer_ticket_"))
@@ -3820,8 +4718,8 @@ async def admin_all_orders(message: Message):
         
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"{status_emoji} *Заказ #{order.order_id}*\n"
@@ -3853,8 +4751,8 @@ async def admin_pending_orders(message: Message):
     for order in orders[:10]:
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"⏳ *Заказ #{order.order_id}*\n"
@@ -3888,8 +4786,8 @@ async def admin_active_orders(message: Message):
         status_text = "Оплачено" if order.status == OrderStatus.PAID else "Подтверждено"
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"{status_emoji} *Заказ #{order.order_id}*\n"
@@ -3921,8 +4819,8 @@ async def admin_completed_orders(message: Message):
     for order in orders[:10]:
         payment_method = "⭐ Звезды" if order.payment_method == PaymentMethod.STARS else "💳 Рубли"
         
-        total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-        total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+        total_rub_str = format_price(order.total_rub)
+        total_stars_str = format_price(order.total_stars)
         
         text = (
             f"🎉 *Заказ #{order.order_id}*\n"
@@ -3955,8 +4853,8 @@ async def admin_confirm_order(callback: CallbackQuery):
     
     db.update_order_status(order_id, OrderStatus.CONFIRMED)
     
-    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-    total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+    total_rub_str = format_price(order.total_rub)
+    total_stars_str = format_price(order.total_stars)
     
     try:
         await bot.send_message(
@@ -4019,8 +4917,8 @@ async def admin_complete_order(callback: CallbackQuery):
     
     db.update_order_status(order_id, OrderStatus.COMPLETED, callback.from_user.id)
     
-    total_rub_str = f"{order.total_rub:.2f}".rstrip('0').rstrip('.') if order.total_rub % 1 else str(int(order.total_rub))
-    total_stars_str = f"{order.total_stars:.2f}".rstrip('0').rstrip('.') if order.total_stars % 1 else str(int(order.total_stars))
+    total_rub_str = format_price(order.total_rub)
+    total_stars_str = format_price(order.total_stars)
     
     try:
         await bot.send_message(
@@ -4088,17 +4986,26 @@ async def on_startup():
     
     # Добавляем тестовые промокоды
     db.add_promocode("TEST10", 10, 30, 100)
-    db.add_promocode("SALE20", 20, 14, 50)
+    db.add_promocode("SALE20", 20, 14, 50, 500)
     
     # Добавляем тестовый конкурс
-    db.add_contest(
-        "Новогодний розыгрыш",
-        "Участвуйте в розыгрыше новогодних призов!",
-        "Сертификат на 1000 рублей",
-        False,
-        None,
-        7
+    prizes = [
+        Prize(PrizeType.DISCOUNT_PROMOCODE, 50, "Промокод на скидку 50%"),
+        Prize(PrizeType.CASH_REWARD, 1000, "Денежный приз 1000₽"),
+        Prize(PrizeType.STARS_REWARD, 500, "500⭐ на счет")
+    ]
+    
+    contest = db.add_contest(
+        name="Новогодний розыгрыш",
+        description="Участвуйте в розыгрыше новогодних призов!",
+        prizes=prizes,
+        required_products=[],
+        min_purchase_amount=0,
+        max_participants=0,
+        days_valid=7,
+        winners_count=3
     )
+    contest.status = ContestStatus.ACTIVE
     
     bot_info = await bot.get_me()
     db.set_bot_username(bot_info.first_name or "ShopBot")
@@ -4107,21 +5014,30 @@ async def on_startup():
         try:
             await bot.send_message(
                 admin_id,
-                "✅ Бот магазина запущен и готов к работе!\n\n"
+                "✅ *Бот магазина запущен и готов к работе!*\n\n"
                 "✨ *Новые функции:*\n"
-                "• 🎁 Система конкурсов с обязательной покупкой\n"
-                "• 🧾 Чеки с именем продавца\n"
-                "• 📦 Разделение заказов на активные и завершенные\n"
-                "• 🔄 Обновление статуса заказов\n"
-                "• 👤 Установка имени продавца\n"
-                "• ✏️ Ручной ввод количества товара\n\n"
+                "• 🎁 Система конкурсов с различными типами призов\n"
+                "• 📦 Обязательные товары для участия в конкурсах\n"
+                "• 💰 Минимальная сумма покупки для участия\n"
+                "• 🎫 Промокоды с минимальной суммой заказа\n"
+                "• 👥 Максимальное количество участников в конкурсе\n"
+                "• 🎲 Автоматический выбор победителей\n"
+                "• 📝 Полное управление конкурсами в админ-панели\n\n"
+                "📌 *Типы призов в конкурсах:*\n"
+                "  • 🎫 Промокод на скидку\n"
+                "  • 🎁 Бесплатный товар\n"
+                "  • 💰 Денежный приз\n"
+                "  • ⭐ Приз звездами\n"
+                "  • 🎨 Индивидуальный приз\n"
+                "  • 🎟️ Купон\n"
+                "  • 📦 Секретный приз\n\n"
                 "Чтобы настроить группу для отзывов:\n"
                 "1. Добавьте бота в группу как администратора\n"
                 "2. Отправьте в группе команду /setreviewsgroup",
                 parse_mode="Markdown"
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to send startup message to admin {admin_id}: {e}")
 
 async def on_shutdown():
     logger.info("Бот остановлен!")
@@ -4137,3 +5053,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# Продолжение кода будет в следующем сообщении из-за ограничения длины...
