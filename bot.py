@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.utils.deep_linking import create_start_link, decode_payload
+from aiogram.utils.deep_linking import create_start_link
 
 # Настройка логирования
 logging.basicConfig(
@@ -79,21 +79,38 @@ class BroadcastType(Enum):
     VIDEO = "video"
     DOCUMENT = "document"
 
-class BroadcastSchedule(Enum):
-    ONCE = "once"
+class RecurringType(Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
-    MONTHLY = "monthly"
+    MONTHLY = "never"
 
-class BroadcastTemplate(Enum):
-    NEW_PRODUCT = "new_product"
-    NEW_CONTEST = "new_contest"
-    PROMOCODE = "promocode"
-    SALE = "sale"
-    HOLIDAY = "holiday"
-    REMINDER = "reminder"
-    THANK_YOU = "thank_you"
-    SURVEY = "survey"
+class BroadcastTemplate:
+    def __init__(self, id: str, name: str, template_text: str, 
+                 broadcast_type: BroadcastType = BroadcastType.TEXT,
+                 media_file_id: str = None, variables: List[str] = None):
+        self.id = id
+        self.name = name
+        self.template_text = template_text
+        self.broadcast_type = broadcast_type
+        self.media_file_id = media_file_id
+        self.variables = variables or []
+        self.created_at = datetime.now()
+
+class RecurringBroadcast:
+    def __init__(self, id: str, name: str, template_id: str, 
+                 recurring_type: RecurringType, next_run: datetime,
+                 target_all: bool = True, target_users: List[int] = None,
+                 last_run: datetime = None):
+        self.id = id
+        self.name = name
+        self.template_id = template_id
+        self.recurring_type = recurring_type
+        self.next_run = next_run
+        self.last_run = last_run
+        self.target_all = target_all
+        self.target_users = target_users or []
+        self.is_active = True
+        self.created_at = datetime.now()
 
 class Product:
     def __init__(self, id: str, name: str, description: str, price_rub: float, price_stars: float, stock: int = 999):
@@ -107,20 +124,6 @@ class Product:
         self.purchases_count = 0
         self.revenue_rub = 0.0
         self.revenue_stars = 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            'id': self.id,
-            'name': self.name,
-            'description': self.description,
-            'price_rub': self.price_rub,
-            'price_stars': self.price_stars,
-            'stock': self.stock,
-            'created_at': self.created_at.isoformat(),
-            'purchases_count': self.purchases_count,
-            'revenue_rub': self.revenue_rub,
-            'revenue_stars': self.revenue_stars
-        }
 
 class Promotion:
     def __init__(self, code: str, discount_percent: int, valid_until: datetime, 
@@ -150,7 +153,7 @@ class Prize:
         if self.type == PrizeType.DISCOUNT_PROMOCODE:
             return f"Промокод на скидку {self.value}%"
         elif self.type == PrizeType.FREE_PRODUCT:
-            return f"Бесплатный товар (ID: {self.value})"
+            return f"Бесплатный товар"
         elif self.type == PrizeType.CASH_REWARD:
             return f"Денежный приз {self.value}₽"
         elif self.type == PrizeType.STARS_REWARD:
@@ -162,18 +165,6 @@ class Prize:
         elif self.type == PrizeType.MYSTERY_BOX:
             return "Секретный приз"
         return "Приз"
-
-    def to_dict(self) -> dict:
-        return {
-            'id': self.id,
-            'type': self.type.value,
-            'value': self.value,
-            'description': self.description,
-            'created_at': self.created_at.isoformat(),
-            'claimed': self.claimed,
-            'claimed_by': self.claimed_by,
-            'claimed_at': self.claimed_at.isoformat() if self.claimed_at else None
-        }
 
 class Contest:
     def __init__(self, id: str, name: str, description: str, prizes: List[Prize],
@@ -195,9 +186,7 @@ class Contest:
         self.winners = []
         self.created_at = datetime.now()
         self.updated_at = datetime.now()
-        self.auto_select_winners = True
         self.invite_link = None
-        self.broadcast_sent = False
     
     def is_active(self) -> bool:
         return self.status == ContestStatus.ACTIVE and datetime.now() < self.end_date
@@ -223,10 +212,10 @@ class Contest:
     def has_participated(self, user_id: int) -> bool:
         return user_id in self.participants
     
-    def get_invite_link(self) -> str:
+    def get_invite_link(self, bot_username: str) -> str:
         if not self.invite_link:
             self.invite_link = f"contest_{self.id}"
-        return self.invite_link
+        return f"https://t.me/{bot_username}?start={self.invite_link}"
     
     def check_purchase_requirements(self, user_id: int, db_connection) -> Tuple[bool, str]:
         if not self.required_products and self.min_purchase_amount <= 0:
@@ -257,7 +246,7 @@ class Contest:
                 return False, f"Необходимо приобрести: {', '.join(product_names)}"
         
         if self.min_purchase_amount > 0 and total_purchased_amount < self.min_purchase_amount:
-            return False, f"Необходимо совершить покупок на сумму {self.min_purchase_amount}₽ (у вас: {total_purchased_amount}₽)"
+            return False, f"Необходимо совершить покупок на сумму {self.min_purchase_amount}₽ (у вас: {total_purchased_amount:.2f}₽)"
         
         return True, "Требования выполнены"
     
@@ -282,34 +271,12 @@ class Contest:
         
         self.winners = winners
         return winners
-    
-    def to_dict(self) -> dict:
-        return {
-            'id': self.id,
-            'name': self.name,
-            'description': self.description,
-            'prizes': [p.to_dict() for p in self.prizes],
-            'required_products': self.required_products,
-            'min_purchase_amount': self.min_purchase_amount,
-            'max_participants': self.max_participants,
-            'start_date': self.start_date.isoformat(),
-            'end_date': self.end_date.isoformat(),
-            'winners_count': self.winners_count,
-            'status': self.status.value,
-            'participants': self.participants,
-            'winners': self.winners,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-            'invite_link': self.invite_link,
-            'broadcast_sent': self.broadcast_sent
-        }
 
 class Broadcast:
     def __init__(self, id: str, name: str, message: str, broadcast_type: BroadcastType = BroadcastType.TEXT,
                  media_file_id: str = None, scheduled_time: datetime = None, 
                  target_users: List[int] = None, target_all: bool = True,
-                 schedule_type: BroadcastSchedule = BroadcastSchedule.ONCE,
-                 template: BroadcastTemplate = None, template_data: dict = None):
+                 recurring_id: str = None):
         self.id = id
         self.name = name
         self.message = message
@@ -318,38 +285,12 @@ class Broadcast:
         self.scheduled_time = scheduled_time
         self.target_users = target_users or []
         self.target_all = target_all
-        self.schedule_type = schedule_type
-        self.template = template
-        self.template_data = template_data or {}
+        self.recurring_id = recurring_id
         self.status = BroadcastStatus.DRAFT
         self.sent_count = 0
         self.failed_count = 0
         self.created_at = datetime.now()
         self.sent_at = None
-        self.last_sent_at = None
-        self.next_send_at = scheduled_time
-
-    def to_dict(self) -> dict:
-        return {
-            'id': self.id,
-            'name': self.name,
-            'message': self.message,
-            'broadcast_type': self.broadcast_type.value,
-            'media_file_id': self.media_file_id,
-            'scheduled_time': self.scheduled_time.isoformat() if self.scheduled_time else None,
-            'target_users': self.target_users,
-            'target_all': self.target_all,
-            'schedule_type': self.schedule_type.value,
-            'template': self.template.value if self.template else None,
-            'template_data': self.template_data,
-            'status': self.status.value,
-            'sent_count': self.sent_count,
-            'failed_count': self.failed_count,
-            'created_at': self.created_at.isoformat(),
-            'sent_at': self.sent_at.isoformat() if self.sent_at else None,
-            'last_sent_at': self.last_sent_at.isoformat() if self.last_sent_at else None,
-            'next_send_at': self.next_send_at.isoformat() if self.next_send_at else None
-        }
 
 class Order:
     def __init__(self, order_id: str, user_id: int, username: str, items: Dict[str, int], 
@@ -423,6 +364,8 @@ class Database:
         self.reviews = []
         self.contests = {}
         self.broadcasts = {}
+        self.broadcast_templates = {}
+        self.recurring_broadcasts = {}
         self.generated_coupons = {}
         self.payment_details = {
             "card": "2200 0000 0000 0000",
@@ -434,6 +377,8 @@ class Database:
         self.next_review_id = 1
         self.next_contest_id = 1
         self.next_broadcast_id = 1
+        self.next_template_id = 1
+        self.next_recurring_id = 1
         self.reviews_group_id = None
         self.bot_username = "ShopBot"
         self.bot_instance = None
@@ -447,58 +392,9 @@ class Database:
             'total_broadcasts': 0,
             'total_messages_sent': 0
         }
-        self.user_referrals = {}
-        self.referral_stats = {}
-        
-        # Предопределенные шаблоны рассылок
-        self.broadcast_templates = {
-            BroadcastTemplate.NEW_PRODUCT: {
-                'name': 'Новый товар',
-                'message': '🆕 *НОВЫЙ ТОВАР!*\n\n{product_name}\n{product_description}\n\n💰 Цена: {product_price_rub}₽ / {product_price_stars}⭐\n\n🛍 Спешите приобрести!',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.NEW_CONTEST: {
-                'name': 'Новый конкурс',
-                'message': '🎁 *НОВЫЙ КОНКУРС!*\n\n{contest_name}\n{contest_description}\n\n🏆 Призы: {contest_prizes}\n📅 Окончание: {contest_end_date}\n\n🎲 Участвуйте и выигрывайте!\n🔗 {contest_link}',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.PROMOCODE: {
-                'name': 'Промокод',
-                'message': '🎫 *ПРОМОКОД!*\n\n{code}\nСкидка: {discount}%\nДействует до: {valid_until}\n\n{message}',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.SALE: {
-                'name': 'Распродажа',
-                'message': '🔥 *РАСПРОДАЖА!*\n\n{message}\n\n📦 Товары со скидкой:\n{products}\n\n🛍 Успейте купить!',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.HOLIDAY: {
-                'name': 'Праздничная',
-                'message': '🎄 *ПОЗДРАВЛЯЕМ С ПРАЗДНИКОМ!*\n\n{message}\n\n🎁 В честь праздника дарим промокод: {promocode}\nСкидка: {discount}%\n\nС праздником!',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.REMINDER: {
-                'name': 'Напоминание',
-                'message': '⏰ *НАПОМИНАНИЕ*\n\n{message}\n\n{action}',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.THANK_YOU: {
-                'name': 'Благодарность',
-                'message': '💝 *СПАСИБО ЗА ПОКУПКУ!*\n\n{user_name}, спасибо, что выбрали нас!\n\n🎁 Для вас промокод на следующую покупку: {promocode}\nСкидка: {discount}%\n\nЖдем вас снова!',
-                'type': BroadcastType.TEXT
-            },
-            BroadcastTemplate.SURVEY: {
-                'name': 'Опрос',
-                'message': '📊 *ОПРОС*\n\n{question}\n\nПожалуйста, примите участие в опросе, это поможет нам стать лучше!',
-                'type': BroadcastType.TEXT
-            }
-        }
 
     def set_bot_instance(self, bot_instance):
         self.bot_instance = bot_instance
-
-    def get_broadcast_template(self, template: BroadcastTemplate) -> dict:
-        return self.broadcast_templates.get(template, {})
 
     # ===== Управление товарами =====
     def add_product(self, name: str, description: str, price_rub: float, price_stars: float, stock: int) -> Product:
@@ -760,7 +656,7 @@ class Database:
 
     def get_contest_by_invite(self, invite_link: str) -> Optional[Contest]:
         for contest in self.contests.values():
-            if contest.get_invite_link() == invite_link:
+            if contest.invite_link == invite_link:
                 return contest
         return None
 
@@ -786,7 +682,7 @@ class Database:
             return True
         return False
 
-    def participate_in_contest(self, contest_id: str, user_id: int, via_invite: bool = False) -> Tuple[bool, str]:
+    def participate_in_contest(self, contest_id: str, user_id: int) -> Tuple[bool, str]:
         contest = self.get_contest(contest_id)
         if not contest:
             return False, "Конкурс не найден"
@@ -803,10 +699,6 @@ class Database:
         
         contest.add_participant(user_id)
         self.stats['total_participants'] += 1
-        
-        if via_invite:
-            self.track_referral(user_id, f"contest_{contest_id}")
-        
         return True, "Вы успешно участвуете в конкурсе! Удачи!"
 
     def has_participated_in_contest(self, contest_id: str, user_id: int) -> bool:
@@ -823,50 +715,86 @@ class Database:
             return winners
         return []
 
-    def send_contest_broadcast(self, contest: Contest) -> str:
-        """Генерирует сообщение для рассылки о конкурсе"""
-        message = (
-            f"🎁 *НОВЫЙ КОНКУРС!*\n\n"
-            f"🏆 *{contest.name}*\n\n"
-            f"{contest.description}\n\n"
-            f"🎲 *Призы:*\n"
-        )
-        
-        for i, prize in enumerate(contest.prizes, 1):
-            message += f"  {i}. {prize.description}\n"
-        
-        message += f"\n📅 *Окончание:* {contest.end_date.strftime('%d.%m.%Y %H:%M')}\n"
-        
-        if contest.required_products:
-            message += f"📦 *Требуемые товары:*\n"
-            for prod_id in contest.required_products:
-                product = self.get_product(prod_id)
-                if product:
-                    message += f"  • {product.name}\n"
-        
-        if contest.min_purchase_amount > 0:
-            message += f"💰 *Мин. сумма покупки:* {format_price(contest.min_purchase_amount)}₽\n"
-        
-        if contest.max_participants > 0:
-            message += f"👥 *Макс. участников:* {contest.max_participants}\n"
-        
-        message += f"\n🎲 *Количество победителей:* {contest.winners_count}\n\n"
-        message += f"Участвуйте и выигрывайте призы!\n"
-        message += f"🔗 [Участвовать в конкурсе](https://t.me/{self.bot_username}?start={contest.get_invite_link()})"
-        
-        return message
+    # ===== Шаблоны рассылок =====
+    def add_broadcast_template(self, name: str, template_text: str, 
+                               broadcast_type: BroadcastType = BroadcastType.TEXT,
+                               media_file_id: str = None) -> BroadcastTemplate:
+        template_id = str(self.next_template_id)
+        self.next_template_id += 1
+        template = BroadcastTemplate(template_id, name, template_text, broadcast_type, media_file_id)
+        self.broadcast_templates[template_id] = template
+        return template
+
+    def get_broadcast_template(self, template_id: str) -> Optional[BroadcastTemplate]:
+        return self.broadcast_templates.get(template_id)
+
+    def get_all_templates(self) -> List[BroadcastTemplate]:
+        return list(self.broadcast_templates.values())
+
+    def delete_broadcast_template(self, template_id: str) -> bool:
+        if template_id in self.broadcast_templates:
+            del self.broadcast_templates[template_id]
+            return True
+        return False
+
+    # ===== Регулярные рассылки =====
+    def add_recurring_broadcast(self, name: str, template_id: str, 
+                                recurring_type: RecurringType, next_run: datetime,
+                                target_all: bool = True, target_users: List[int] = None) -> RecurringBroadcast:
+        recurring_id = str(self.next_recurring_id)
+        self.next_recurring_id += 1
+        recurring = RecurringBroadcast(recurring_id, name, template_id, recurring_type, 
+                                       next_run, target_all, target_users)
+        self.recurring_broadcasts[recurring_id] = recurring
+        return recurring
+
+    def get_recurring_broadcast(self, recurring_id: str) -> Optional[RecurringBroadcast]:
+        return self.recurring_broadcasts.get(recurring_id)
+
+    def get_all_recurring_broadcasts(self) -> List[RecurringBroadcast]:
+        return list(self.recurring_broadcasts.values())
+
+    def update_recurring_broadcast(self, recurring_id: str, **kwargs) -> bool:
+        if recurring_id in self.recurring_broadcasts:
+            recurring = self.recurring_broadcasts[recurring_id]
+            for key, value in kwargs.items():
+                if hasattr(recurring, key):
+                    setattr(recurring, key, value)
+            return True
+        return False
+
+    def delete_recurring_broadcast(self, recurring_id: str) -> bool:
+        if recurring_id in self.recurring_broadcasts:
+            del self.recurring_broadcasts[recurring_id]
+            return True
+        return False
+
+    def update_recurring_next_run(self, recurring_id: str):
+        recurring = self.get_recurring_broadcast(recurring_id)
+        if recurring:
+            if recurring.recurring_type == RecurringType.DAILY:
+                recurring.next_run += timedelta(days=1)
+            elif recurring.recurring_type == RecurringType.WEEKLY:
+                recurring.next_run += timedelta(weeks=1)
+            elif recurring.recurring_type == RecurringType.MONTHLY:
+                # Добавляем месяц (приблизительно)
+                new_month = recurring.next_run.month + 1
+                new_year = recurring.next_run.year
+                if new_month > 12:
+                    new_month = 1
+                    new_year += 1
+                recurring.next_run = recurring.next_run.replace(year=new_year, month=new_month)
+            recurring.last_run = datetime.now()
 
     # ===== Рассылки =====
     def add_broadcast(self, name: str, message: str, broadcast_type: BroadcastType = BroadcastType.TEXT,
                       media_file_id: str = None, scheduled_time: datetime = None,
                       target_users: List[int] = None, target_all: bool = True,
-                      schedule_type: BroadcastSchedule = BroadcastSchedule.ONCE,
-                      template: BroadcastTemplate = None, template_data: dict = None) -> Broadcast:
+                      recurring_id: str = None) -> Broadcast:
         broadcast_id = str(self.next_broadcast_id)
         self.next_broadcast_id += 1
         broadcast = Broadcast(broadcast_id, name, message, broadcast_type, media_file_id,
-                             scheduled_time, target_users, target_all, schedule_type,
-                             template, template_data)
+                             scheduled_time, target_users, target_all, recurring_id)
         self.broadcasts[broadcast_id] = broadcast
         self.stats['total_broadcasts'] += 1
         return broadcast
@@ -876,15 +804,6 @@ class Database:
 
     def get_all_broadcasts(self) -> List[Broadcast]:
         return list(self.broadcasts.values())
-
-    def get_scheduled_broadcasts(self) -> List[Broadcast]:
-        now = datetime.now()
-        return [b for b in self.broadcasts.values() 
-                if b.status == BroadcastStatus.SCHEDULED and b.next_send_at and b.next_send_at <= now]
-
-    def get_recurring_broadcasts(self) -> List[Broadcast]:
-        return [b for b in self.broadcasts.values() 
-                if b.schedule_type != BroadcastSchedule.ONCE and b.status == BroadcastStatus.SCHEDULED]
 
     def update_broadcast(self, broadcast_id: str, **kwargs) -> bool:
         if broadcast_id in self.broadcasts:
@@ -904,18 +823,7 @@ class Database:
     def get_all_users(self) -> List[int]:
         return list(self.stats['total_users'])
 
-    def apply_template(self, template: BroadcastTemplate, data: dict) -> str:
-        """Применяет шаблон с данными"""
-        template_info = self.get_broadcast_template(template)
-        message = template_info.get('message', '')
-        
-        for key, value in data.items():
-            message = message.replace(f'{{{key}}}', str(value))
-        
-        return message
-
     async def execute_broadcast(self, broadcast_id: str):
-        """Выполняет рассылку"""
         broadcast = self.get_broadcast(broadcast_id)
         if not broadcast or broadcast.status != BroadcastStatus.SCHEDULED:
             return
@@ -942,46 +850,38 @@ class Database:
             except Exception as e:
                 broadcast.failed_count += 1
                 logger.error(f"Broadcast failed for user {user_id}: {e}")
-        
-        # Обновляем время последней отправки
-        broadcast.last_sent_at = datetime.now()
-        
-        # Если это регулярная рассылка, планируем следующую
-        if broadcast.schedule_type != BroadcastSchedule.ONCE:
-            broadcast.status = BroadcastStatus.SCHEDULED
-            broadcast.next_send_at = self.get_next_send_time(broadcast)
-            self.update_broadcast(broadcast.id, next_send_at=broadcast.next_send_at)
 
-    def get_next_send_time(self, broadcast: Broadcast) -> datetime:
-        """Вычисляет следующее время отправки для регулярной рассылки"""
-        now = datetime.now()
+    def get_contest_broadcast_message(self, contest: Contest) -> str:
+        message = (
+            f"🎁 *НОВЫЙ КОНКУРС!*\n\n"
+            f"🏆 *{contest.name}*\n\n"
+            f"{contest.description}\n\n"
+            f"🎲 *Призы:*\n"
+        )
         
-        if broadcast.schedule_type == BroadcastSchedule.DAILY:
-            return now + timedelta(days=1)
-        elif broadcast.schedule_type == BroadcastSchedule.WEEKLY:
-            return now + timedelta(weeks=1)
-        elif broadcast.schedule_type == BroadcastSchedule.MONTHLY:
-            # Добавляем месяц
-            if now.month == 12:
-                return now.replace(year=now.year + 1, month=1)
-            else:
-                return now.replace(month=now.month + 1)
+        for i, prize in enumerate(contest.prizes, 1):
+            message += f"  {i}. {prize.description}\n"
         
-        return broadcast.scheduled_time if broadcast.scheduled_time else now
-
-    # ===== Реферальная система =====
-    def track_referral(self, user_id: int, referrer_code: str):
-        if user_id not in self.user_referrals:
-            self.user_referrals[user_id] = []
-        if referrer_code not in self.user_referrals[user_id]:
-            self.user_referrals[user_id].append(referrer_code)
-            
-            if referrer_code not in self.referral_stats:
-                self.referral_stats[referrer_code] = 0
-            self.referral_stats[referrer_code] += 1
-
-    def get_referral_stats(self, referrer_code: str) -> int:
-        return self.referral_stats.get(referrer_code, 0)
+        message += f"\n📅 *Окончание:* {contest.end_date.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        if contest.required_products:
+            message += f"📦 *Требуемые товары:*\n"
+            for prod_id in contest.required_products:
+                product = self.get_product(prod_id)
+                if product:
+                    message += f"  • {product.name}\n"
+        
+        if contest.min_purchase_amount > 0:
+            message += f"💰 *Мин. сумма покупки:* {contest.min_purchase_amount:.2f}₽\n"
+        
+        if contest.max_participants > 0:
+            message += f"👥 *Макс. участников:* {contest.max_participants}\n"
+        
+        message += f"\n🎲 *Количество победителей:* {contest.winners_count}\n\n"
+        message += f"Участвуйте и выигрывайте призы!\n"
+        message += f"🔗 [Участвовать в конкурсе]({contest.get_invite_link(self.bot_username)})"
+        
+        return message
 
     # ===== Настройки =====
     def set_bot_username(self, username: str):
@@ -1016,7 +916,9 @@ class Database:
             'active_orders': len(self.get_active_orders()),
             'completed_orders': len(self.get_completed_orders()),
             'total_broadcasts': self.stats['total_broadcasts'],
-            'total_messages_sent': self.stats['total_messages_sent']
+            'total_messages_sent': self.stats['total_messages_sent'],
+            'total_templates': len(self.broadcast_templates),
+            'total_recurring': len(self.recurring_broadcasts)
         }
 
 db = Database()
@@ -1066,16 +968,21 @@ class AdminStates(StatesGroup):
     waiting_for_contest_max_participants = State()
     waiting_for_contest_required_products = State()
     waiting_for_contest_min_amount = State()
-    waiting_for_contest_product_selection = State()
     waiting_for_broadcast_name = State()
     waiting_for_broadcast_message = State()
     waiting_for_broadcast_type = State()
     waiting_for_broadcast_media = State()
     waiting_for_broadcast_schedule = State()
     waiting_for_broadcast_target = State()
-    waiting_for_broadcast_template = State()
-    waiting_for_broadcast_template_data = State()
-    waiting_for_broadcast_recurring = State()
+    waiting_for_template_name = State()
+    waiting_for_template_message = State()
+    waiting_for_template_type = State()
+    waiting_for_template_media = State()
+    waiting_for_recurring_name = State()
+    waiting_for_recurring_template = State()
+    waiting_for_recurring_type = State()
+    waiting_for_recurring_time = State()
+    waiting_for_recurring_target = State()
 
 class UserStates(StatesGroup):
     waiting_for_promocode = State()
@@ -1119,33 +1026,12 @@ def get_broadcast_keyboard():
     buttons = [
         [KeyboardButton(text="➕ Создать рассылку")],
         [KeyboardButton(text="📋 Список рассылок")],
-        [KeyboardButton(text="⏰ Регулярные рассылки")],
-        [KeyboardButton(text="📝 Готовые шаблоны")],
+        [KeyboardButton(text="📝 Шаблоны рассылок")],
+        [KeyboardButton(text="🔄 Регулярные рассылки")],
         [KeyboardButton(text="📊 Статистика рассылок")],
         [KeyboardButton(text="🔙 На главную")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-def get_broadcast_template_keyboard():
-    builder = InlineKeyboardBuilder()
-    for template in BroadcastTemplate:
-        template_info = db.get_broadcast_template(template)
-        builder.row(InlineKeyboardButton(
-            text=f"📝 {template_info.get('name', template.value)}",
-            callback_data=f"broadcast_template_{template.value}"
-        ))
-    builder.row(InlineKeyboardButton(text="✏️ Своя рассылка", callback_data="broadcast_custom"))
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
-    return builder.as_markup()
-
-def get_broadcast_recurring_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔁 Один раз", callback_data="recurring_once"))
-    builder.row(InlineKeyboardButton(text="📅 Ежедневно", callback_data="recurring_daily"))
-    builder.row(InlineKeyboardButton(text="📆 Еженедельно", callback_data="recurring_weekly"))
-    builder.row(InlineKeyboardButton(text="📅 Ежемесячно", callback_data="recurring_monthly"))
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
-    return builder.as_markup()
 
 def get_broadcast_type_keyboard():
     builder = InlineKeyboardBuilder()
@@ -1170,6 +1056,14 @@ def get_broadcast_schedule_keyboard():
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
     return builder.as_markup()
 
+def get_recurring_type_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📅 Ежедневно", callback_data="recurring_daily"))
+    builder.row(InlineKeyboardButton(text="📆 Еженедельно", callback_data="recurring_weekly"))
+    builder.row(InlineKeyboardButton(text="📅 Ежемесячно", callback_data="recurring_monthly"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    return builder.as_markup()
+
 def get_broadcast_list_keyboard(page: int = 0):
     broadcasts = db.get_all_broadcasts()
     items_per_page = 5
@@ -1189,15 +1083,8 @@ def get_broadcast_list_keyboard(page: int = 0):
             BroadcastStatus.CANCELLED: "❌"
         }.get(broadcast.status, "❓")
         
-        recurring_emoji = {
-            BroadcastSchedule.ONCE: "",
-            BroadcastSchedule.DAILY: " 🔁",
-            BroadcastSchedule.WEEKLY: " 📆",
-            BroadcastSchedule.MONTHLY: " 📅"
-        }.get(broadcast.schedule_type, "")
-        
         builder.row(InlineKeyboardButton(
-            text=f"{status_emoji} {broadcast.name}{recurring_emoji}",
+            text=f"{status_emoji} {broadcast.name[:30]}",
             callback_data=f"broadcast_{broadcast.id}"
         ))
     
@@ -1210,21 +1097,45 @@ def get_broadcast_list_keyboard(page: int = 0):
     if nav_buttons:
         builder.row(*nav_buttons)
     
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_broadcasts_menu"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_broadcasts"))
     
     return builder.as_markup()
 
-def get_broadcast_actions_keyboard(broadcast_id: str):
+def get_templates_keyboard():
+    templates = db.get_all_templates()
+    
     builder = InlineKeyboardBuilder()
-    broadcast = db.get_broadcast(broadcast_id)
     
-    if broadcast and broadcast.status == BroadcastStatus.DRAFT:
-        builder.row(InlineKeyboardButton(text="🚀 Отправить", callback_data=f"send_broadcast_{broadcast_id}"))
-        builder.row(InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_broadcast_{broadcast_id}"))
-        builder.row(InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_broadcast_{broadcast_id}"))
-    elif broadcast and broadcast.status == BroadcastStatus.SCHEDULED:
-        builder.row(InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_broadcast_{broadcast_id}"))
+    for template in templates:
+        builder.row(InlineKeyboardButton(
+            text=f"📝 {template.name[:30]}",
+            callback_data=f"template_{template.id}"
+        ))
     
+    builder.row(InlineKeyboardButton(text="➕ Создать шаблон", callback_data="create_template"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_broadcasts"))
+    
+    return builder.as_markup()
+
+def get_recurring_keyboard():
+    recurring_list = db.get_all_recurring_broadcasts()
+    
+    builder = InlineKeyboardBuilder()
+    
+    for recurring in recurring_list:
+        status = "🟢" if recurring.is_active else "🔴"
+        type_emoji = {
+            RecurringType.DAILY: "📅",
+            RecurringType.WEEKLY: "📆",
+            RecurringType.MONTHLY: "📅"
+        }.get(recurring.recurring_type, "🔄")
+        
+        builder.row(InlineKeyboardButton(
+            text=f"{status} {type_emoji} {recurring.name[:30]}",
+            callback_data=f"recurring_{recurring.id}"
+        ))
+    
+    builder.row(InlineKeyboardButton(text="➕ Создать регулярную рассылку", callback_data="create_recurring"))
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_broadcasts"))
     
     return builder.as_markup()
@@ -1517,32 +1428,35 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     args = message.text.split()
     
+    # Проверяем, есть ли аргумент (ссылка на конкурс)
     if len(args) > 1:
         payload = args[1]
-        contest = db.get_contest_by_invite(payload)
-        
-        if contest and contest.is_active():
-            success, msg = db.participate_in_contest(contest.id, user_id, via_invite=True)
+        if payload.startswith("contest_"):
+            contest_id = payload.split("_")[1]
+            contest = db.get_contest(contest_id)
             
-            if success:
-                await message.answer(
-                    f"🎉 *Поздравляем!*\n\n"
-                    f"Вы успешно участвуете в конкурсе *{contest.name}*!\n\n"
-                    f"{msg}\n\n"
-                    f"🎲 *Количество участников:* {len(contest.participants)}\n"
-                    f"🏆 *Призы:* {len(contest.prizes)} шт.\n\n"
-                    f"Желаем удачи!",
-                    parse_mode="Markdown",
-                    reply_markup=get_main_keyboard(is_admin(user_id))
-                )
-                return
-            else:
-                await message.answer(
-                    f"❌ *Не удалось участвовать в конкурсе*\n\n{msg}",
-                    parse_mode="Markdown",
-                    reply_markup=get_main_keyboard(is_admin(user_id))
-                )
-                return
+            if contest and contest.is_active():
+                success, msg = db.participate_in_contest(contest.id, user_id)
+                
+                if success:
+                    await message.answer(
+                        f"🎉 *Поздравляем!*\n\n"
+                        f"Вы успешно участвуете в конкурсе *{contest.name}*!\n\n"
+                        f"{msg}\n\n"
+                        f"🎲 *Количество участников:* {len(contest.participants)}\n"
+                        f"🏆 *Призы:* {len(contest.prizes)} шт.\n\n"
+                        f"Желаем удачи!",
+                        parse_mode="Markdown",
+                        reply_markup=get_main_keyboard(is_admin(user_id))
+                    )
+                    return
+                else:
+                    await message.answer(
+                        f"❌ *Не удалось участвовать в конкурсе*\n\n{msg}",
+                        parse_mode="Markdown",
+                        reply_markup=get_main_keyboard(is_admin(user_id))
+                    )
+                    return
     
     await message.answer(
         f"👋 Добро пожаловать в магазин!\n\n"
@@ -1666,11 +1580,8 @@ async def view_contest(callback: CallbackQuery):
     elif has_participated:
         contest_text += f"\n\n✅ *Вы уже участвуете в конкурсе!*"
     
-    bot_username = db.get_bot_username()
-    invite_link = f"https://t.me/{bot_username}?start={contest.get_invite_link()}"
-    
-    contest_text += f"\n\n🔗 *Поделитесь ссылкой с друзьями:*\n"
-    contest_text += f"`{invite_link}`"
+    invite_link = contest.get_invite_link(db.get_bot_username())
+    contest_text += f"\n\n🔗 *Поделитесь ссылкой с друзьями:*\n`{invite_link}`"
     
     keyboard = InlineKeyboardBuilder()
     
@@ -1699,7 +1610,7 @@ async def view_contest(callback: CallbackQuery):
 async def participate_in_contest(callback: CallbackQuery):
     contest_id = callback.data.split("_")[1]
     
-    success, message = db.participate_in_contest(contest_id, callback.from_user.id, via_invite=False)
+    success, message = db.participate_in_contest(contest_id, callback.from_user.id)
     
     if success:
         await callback.answer("✅ Вы успешно участвуете в конкурсе! Удачи!", show_alert=True)
@@ -1716,8 +1627,7 @@ async def share_contest(callback: CallbackQuery):
         await callback.answer("Конкурс не найден", show_alert=True)
         return
     
-    bot_username = db.get_bot_username()
-    invite_link = f"https://t.me/{bot_username}?start={contest.get_invite_link()}"
+    invite_link = contest.get_invite_link(db.get_bot_username())
     
     share_text = (
         f"🎁 *Приглашаю участвовать в конкурсе!*\n\n"
@@ -1773,11 +1683,11 @@ async def broadcasts_menu(message: Message):
     await message.answer(
         "📢 *Управление рассылками*\n\n"
         "Здесь вы можете создавать и управлять рассылками для пользователей.\n\n"
-        "📝 *Доступные типы рассылок:*\n"
-        "• Обычные рассылки (текст, фото, видео)\n"
-        "• Регулярные рассылки (ежедневно, еженедельно, ежемесячно)\n"
-        "• Готовые шаблоны (новый товар, конкурс, промокод и др.)\n"
-        "• Автоматические рассылки о конкурсах",
+        "• 📝 *Создать рассылку* - разовая рассылка\n"
+        "• 📋 *Список рассылок* - просмотр всех рассылок\n"
+        "• 📝 *Шаблоны рассылок* - создание и использование шаблонов\n"
+        "• 🔄 *Регулярные рассылки* - ежедневные/еженедельные рассылки\n"
+        "• 📊 *Статистика* - общая статистика рассылок",
         parse_mode="Markdown",
         reply_markup=get_broadcast_keyboard()
     )
@@ -1787,95 +1697,6 @@ async def create_broadcast_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id) or is_group_chat(message):
         return
     
-    await state.set_state(AdminStates.waiting_for_broadcast_template)
-    await message.answer(
-        "Выберите тип рассылки:",
-        reply_markup=get_broadcast_template_keyboard()
-    )
-
-@dp.callback_query(F.data.startswith("broadcast_template_"))
-async def select_broadcast_template(callback: CallbackQuery, state: FSMContext):
-    template_name = callback.data.split("_")[2]
-    
-    template = None
-    for t in BroadcastTemplate:
-        if t.value == template_name:
-            template = t
-            break
-    
-    if template:
-        await state.update_data(broadcast_template=template)
-        template_info = db.get_broadcast_template(template)
-        
-        await state.set_state(AdminStates.waiting_for_broadcast_template_data)
-        await callback.message.answer(
-            f"📝 *Шаблон: {template_info.get('name')}*\n\n"
-            f"Шаблон сообщения:\n```\n{template_info.get('message')}\n```\n\n"
-            f"Введите данные для шаблона в формате JSON:\n"
-            f"Например: {{\"product_name\": \"Товар\", \"product_price_rub\": \"100\"}}\n\n"
-            f"Или отправьте 'пропустить' для использования без данных.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_template_data")],
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
-                ]
-            )
-        )
-    else:
-        await callback.message.answer("Выберите тип рассылки:")
-        await callback.answer()
-
-@dp.callback_query(F.data == "broadcast_custom")
-async def custom_broadcast(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(broadcast_template=None)
-    await state.set_state(AdminStates.waiting_for_broadcast_name)
-    await callback.message.answer(
-        "Введите название рассылки:",
-        reply_markup=get_cancel_inline_keyboard()
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "skip_template_data")
-async def skip_template_data(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_for_broadcast_name)
-    await callback.message.answer(
-        "Введите название рассылки:",
-        reply_markup=get_cancel_inline_keyboard()
-    )
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_broadcast_template_data)
-async def process_template_data(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer(
-            "Действие отменено.",
-            reply_markup=get_admin_keyboard()
-        )
-        return
-    
-    data = await state.get_data()
-    template = data.get('broadcast_template')
-    
-    if message.text.lower() == "пропустить":
-        template_data = {}
-    else:
-        try:
-            template_data = json.loads(message.text)
-        except json.JSONDecodeError:
-            await message.answer(
-                "❌ Неверный формат JSON. Попробуйте снова или отправьте 'пропустить':",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_template_data")],
-                        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
-                    ]
-                )
-            )
-            return
-    
-    await state.update_data(broadcast_template_data=template_data)
     await state.set_state(AdminStates.waiting_for_broadcast_name)
     await message.answer(
         "Введите название рассылки:",
@@ -1893,6 +1714,74 @@ async def create_broadcast_name(message: Message, state: FSMContext):
         return
     
     await state.update_data(broadcast_name=message.text)
+    await state.set_state(AdminStates.waiting_for_broadcast_message)
+    await message.answer(
+        "Введите текст сообщения для рассылки (можно использовать Markdown):\n\n"
+        "Доступные переменные:\n"
+        "• {name} - имя пользователя\n"
+        "• {username} - username пользователя\n"
+        "• {date} - текущая дата\n"
+        "• {time} - текущее время",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📝 Использовать шаблон", callback_data="use_template")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+            ]
+        )
+    )
+
+@dp.callback_query(F.data == "use_template")
+async def use_template_for_broadcast(callback: CallbackQuery, state: FSMContext):
+    templates = db.get_all_templates()
+    
+    if not templates:
+        await callback.answer("Нет доступных шаблонов", show_alert=True)
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for template in templates:
+        builder.row(InlineKeyboardButton(
+            text=f"📝 {template.name}",
+            callback_data=f"select_template_{template.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await callback.message.answer(
+        "Выберите шаблон:",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("select_template_"))
+async def apply_template(callback: CallbackQuery, state: FSMContext):
+    template_id = callback.data.split("_")[2]
+    template = db.get_broadcast_template(template_id)
+    
+    if template:
+        await state.update_data(broadcast_message=template.template_text)
+        await state.update_data(broadcast_type=template.broadcast_type)
+        await state.update_data(broadcast_media=template.media_file_id)
+        
+        await callback.message.answer(
+            f"✅ Шаблон \"{template.name}\" применен!\n\n"
+            f"Текст сообщения:\n{template.template_text[:200]}...\n\n"
+            f"Продолжаем настройку рассылки...",
+            reply_markup=get_broadcast_schedule_keyboard()
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_schedule)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_broadcast_message)
+async def create_broadcast_message(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(broadcast_message=message.text)
     await state.set_state(AdminStates.waiting_for_broadcast_type)
     await message.answer(
         "Выберите тип рассылки:",
@@ -1913,59 +1802,20 @@ async def create_broadcast_type(callback: CallbackQuery, state: FSMContext):
     broadcast_type = type_map.get(broadcast_type_str, BroadcastType.TEXT)
     await state.update_data(broadcast_type=broadcast_type)
     
-    data = await state.get_data()
-    template = data.get('broadcast_template')
-    template_data = data.get('broadcast_template_data', {})
-    
-    if template:
-        # Генерируем сообщение из шаблона
-        message_text = db.apply_template(template, template_data)
-        await state.update_data(broadcast_message=message_text)
-        
-        if broadcast_type != BroadcastType.TEXT:
-            await state.set_state(AdminStates.waiting_for_broadcast_media)
-            await callback.message.answer(
-                "Отправьте медиафайл для рассылки (фото, видео или документ):",
-                reply_markup=get_cancel_inline_keyboard()
-            )
-        else:
-            await state.set_state(AdminStates.waiting_for_broadcast_recurring)
-            await callback.message.answer(
-                "Выберите периодичность рассылки:",
-                reply_markup=get_broadcast_recurring_keyboard()
-            )
+    if broadcast_type != BroadcastType.TEXT:
+        await state.set_state(AdminStates.waiting_for_broadcast_media)
+        await callback.message.answer(
+            "Отправьте медиафайл для рассылки (фото, видео или документ):",
+            reply_markup=get_cancel_inline_keyboard()
+        )
     else:
-        if broadcast_type != BroadcastType.TEXT:
-            await state.set_state(AdminStates.waiting_for_broadcast_media)
-            await callback.message.answer(
-                "Отправьте медиафайл для рассылки (фото, видео или документ):",
-                reply_markup=get_cancel_inline_keyboard()
-            )
-        else:
-            await state.set_state(AdminStates.waiting_for_broadcast_message)
-            await callback.message.answer(
-                "Введите текст сообщения для рассылки (можно использовать Markdown):",
-                reply_markup=get_cancel_inline_keyboard()
-            )
+        await state.set_state(AdminStates.waiting_for_broadcast_schedule)
+        await callback.message.answer(
+            "Выберите время отправки:",
+            reply_markup=get_broadcast_schedule_keyboard()
+        )
     
     await callback.answer()
-
-@dp.message(AdminStates.waiting_for_broadcast_message)
-async def create_broadcast_message(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer(
-            "Действие отменено.",
-            reply_markup=get_admin_keyboard()
-        )
-        return
-    
-    await state.update_data(broadcast_message=message.text)
-    await state.set_state(AdminStates.waiting_for_broadcast_recurring)
-    await message.answer(
-        "Выберите периодичность рассылки:",
-        reply_markup=get_broadcast_recurring_keyboard()
-    )
 
 @dp.message(AdminStates.waiting_for_broadcast_media)
 async def create_broadcast_media(message: Message, state: FSMContext):
@@ -1992,32 +1842,11 @@ async def create_broadcast_media(message: Message, state: FSMContext):
         return
     
     await state.update_data(broadcast_media=file_id)
-    await state.set_state(AdminStates.waiting_for_broadcast_recurring)
-    await message.answer(
-        "Выберите периодичность рассылки:",
-        reply_markup=get_broadcast_recurring_keyboard()
-    )
-
-@dp.callback_query(F.data.startswith("recurring_"))
-async def set_broadcast_recurring(callback: CallbackQuery, state: FSMContext):
-    recurring_type = callback.data.split("_")[1]
-    
-    schedule_map = {
-        "once": BroadcastSchedule.ONCE,
-        "daily": BroadcastSchedule.DAILY,
-        "weekly": BroadcastSchedule.WEEKLY,
-        "monthly": BroadcastSchedule.MONTHLY
-    }
-    
-    schedule_type = schedule_map.get(recurring_type, BroadcastSchedule.ONCE)
-    await state.update_data(broadcast_schedule_type=schedule_type)
-    
     await state.set_state(AdminStates.waiting_for_broadcast_schedule)
-    await callback.message.answer(
+    await message.answer(
         "Выберите время отправки:",
         reply_markup=get_broadcast_schedule_keyboard()
     )
-    await callback.answer()
 
 @dp.callback_query(F.data == "broadcast_now")
 async def broadcast_now(callback: CallbackQuery, state: FSMContext):
@@ -2081,27 +1910,21 @@ async def broadcast_target_all(callback: CallbackQuery, state: FSMContext):
         broadcast_type=data['broadcast_type'],
         media_file_id=data.get('broadcast_media'),
         scheduled_time=data.get('broadcast_schedule'),
-        target_all=True,
-        schedule_type=data.get('broadcast_schedule_type', BroadcastSchedule.ONCE),
-        template=data.get('broadcast_template'),
-        template_data=data.get('broadcast_template_data', {})
+        target_all=True
     )
     
     if data.get('broadcast_schedule'):
         broadcast.status = BroadcastStatus.SCHEDULED
-        broadcast.next_send_at = data['broadcast_schedule']
         await callback.message.answer(
-            f"✅ Рассылка \"{broadcast.name}\" запланирована на {data['broadcast_schedule'].strftime('%d.%m.%Y %H:%M')}!\n"
-            f"📅 Периодичность: {broadcast.schedule_type.value}",
+            f"✅ Рассылка \"{broadcast.name}\" запланирована на {data['broadcast_schedule'].strftime('%d.%m.%Y %H:%M')}!",
             reply_markup=get_admin_keyboard()
         )
     else:
         broadcast.status = BroadcastStatus.SCHEDULED
-        broadcast.next_send_at = datetime.now()
+        broadcast.scheduled_time = datetime.now()
         
         await callback.message.answer(
-            f"✅ Рассылка \"{broadcast.name}\" запущена!\n"
-            f"📅 Периодичность: {broadcast.schedule_type.value}",
+            f"✅ Рассылка \"{broadcast.name}\" запущена!",
             reply_markup=get_admin_keyboard()
         )
         
@@ -2139,29 +1962,23 @@ async def process_broadcast_target(message: Message, state: FSMContext):
             media_file_id=data.get('broadcast_media'),
             scheduled_time=data.get('broadcast_schedule'),
             target_all=False,
-            target_users=user_ids,
-            schedule_type=data.get('broadcast_schedule_type', BroadcastSchedule.ONCE),
-            template=data.get('broadcast_template'),
-            template_data=data.get('broadcast_template_data', {})
+            target_users=user_ids
         )
         
         if data.get('broadcast_schedule'):
             broadcast.status = BroadcastStatus.SCHEDULED
-            broadcast.next_send_at = data['broadcast_schedule']
             await message.answer(
                 f"✅ Рассылка \"{broadcast.name}\" запланирована на {data['broadcast_schedule'].strftime('%d.%m.%Y %H:%M')}!\n"
-                f"👥 Получателей: {len(user_ids)}\n"
-                f"📅 Периодичность: {broadcast.schedule_type.value}",
+                f"Получателей: {len(user_ids)}",
                 reply_markup=get_admin_keyboard()
             )
         else:
             broadcast.status = BroadcastStatus.SCHEDULED
-            broadcast.next_send_at = datetime.now()
+            broadcast.scheduled_time = datetime.now()
             
             await message.answer(
                 f"✅ Рассылка \"{broadcast.name}\" запущена!\n"
-                f"👥 Получателей: {len(user_ids)}\n"
-                f"📅 Периодичность: {broadcast.schedule_type.value}",
+                f"Получателей: {len(user_ids)}",
                 reply_markup=get_admin_keyboard()
             )
             
@@ -2191,82 +2008,6 @@ async def list_broadcasts(message: Message):
         reply_markup=get_broadcast_list_keyboard()
     )
 
-@dp.message(F.text == "⏰ Регулярные рассылки")
-async def list_recurring_broadcasts(message: Message):
-    if not is_admin(message.from_user.id) or is_group_chat(message):
-        return
-    
-    broadcasts = db.get_recurring_broadcasts()
-    
-    if not broadcasts:
-        await message.answer("📭 Нет регулярных рассылок.")
-        return
-    
-    text = "⏰ *Регулярные рассылки:*\n\n"
-    for b in broadcasts:
-        schedule_text = {
-            BroadcastSchedule.DAILY: "Ежедневно",
-            BroadcastSchedule.WEEKLY: "Еженедельно",
-            BroadcastSchedule.MONTHLY: "Ежемесячно"
-        }.get(b.schedule_type, "Неизвестно")
-        
-        next_send = b.next_send_at.strftime('%d.%m.%Y %H:%M') if b.next_send_at else "Не запланировано"
-        
-        text += f"• *{b.name}*\n"
-        text += f"  📅 Периодичность: {schedule_text}\n"
-        text += f"  ⏰ Следующая отправка: {next_send}\n"
-        text += f"  ✅ Успешно: {b.sent_count} | ❌ Ошибок: {b.failed_count}\n\n"
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=get_broadcast_keyboard())
-
-@dp.message(F.text == "📝 Готовые шаблоны")
-async def list_templates(message: Message):
-    if not is_admin(message.from_user.id) or is_group_chat(message):
-        return
-    
-    text = "📝 *Готовые шаблоны рассылок:*\n\n"
-    
-    for template in BroadcastTemplate:
-        template_info = db.get_broadcast_template(template)
-        text += f"• *{template_info.get('name')}*\n"
-        text += f"  Шаблон: `{template_info.get('message')[:100]}...`\n\n"
-    
-    text += "\nИспользуйте кнопку '➕ Создать рассылку' для выбора шаблона."
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=get_broadcast_keyboard())
-
-@dp.message(F.text == "📊 Статистика рассылок")
-async def broadcast_stats(message: Message):
-    if not is_admin(message.from_user.id) or is_group_chat(message):
-        return
-    
-    broadcasts = db.get_all_broadcasts()
-    total_sent = sum(b.sent_count for b in broadcasts)
-    total_failed = sum(b.failed_count for b in broadcasts)
-    
-    recurring = [b for b in broadcasts if b.schedule_type != BroadcastSchedule.ONCE]
-    
-    text = (
-        f"📊 *Статистика рассылок*\n\n"
-        f"📢 *Всего рассылок:* {len(broadcasts)}\n"
-        f"🔄 *Регулярных рассылок:* {len(recurring)}\n"
-        f"✅ *Доставлено сообщений:* {total_sent}\n"
-        f"❌ *Ошибок:* {total_failed}\n"
-        f"📈 *Успешность:* {(total_sent/(total_sent+total_failed)*100) if total_sent+total_failed > 0 else 0:.1f}%\n\n"
-        f"📋 *По статусам:*\n"
-        f"  • Черновики: {len([b for b in broadcasts if b.status == BroadcastStatus.DRAFT])}\n"
-        f"  • Отправлены: {len([b for b in broadcasts if b.status == BroadcastStatus.SENT])}\n"
-        f"  • Запланированы: {len([b for b in broadcasts if b.status == BroadcastStatus.SCHEDULED])}\n"
-        f"  • Отменены: {len([b for b in broadcasts if b.status == BroadcastStatus.CANCELLED])}\n\n"
-        f"📅 *По периодичности:*\n"
-        f"  • Обычные: {len([b for b in broadcasts if b.schedule_type == BroadcastSchedule.ONCE])}\n"
-        f"  • Ежедневные: {len([b for b in broadcasts if b.schedule_type == BroadcastSchedule.DAILY])}\n"
-        f"  • Еженедельные: {len([b for b in broadcasts if b.schedule_type == BroadcastSchedule.WEEKLY])}\n"
-        f"  • Ежемесячные: {len([b for b in broadcasts if b.schedule_type == BroadcastSchedule.MONTHLY])}"
-    )
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=get_broadcast_keyboard())
-
 @dp.callback_query(F.data.startswith("broadcasts_page_"))
 async def broadcasts_pagination(callback: CallbackQuery):
     page = int(callback.data.split("_")[2])
@@ -2289,18 +2030,10 @@ async def view_broadcast(callback: CallbackQuery):
         BroadcastStatus.CANCELLED: "❌ Отменена"
     }.get(broadcast.status, "❓")
     
-    schedule_text = {
-        BroadcastSchedule.ONCE: "Один раз",
-        BroadcastSchedule.DAILY: "Ежедневно",
-        BroadcastSchedule.WEEKLY: "Еженедельно",
-        BroadcastSchedule.MONTHLY: "Ежемесячно"
-    }.get(broadcast.schedule_type, "Неизвестно")
-    
     text = (
         f"📢 *{broadcast.name}*\n\n"
         f"📊 *Статус:* {status_text}\n"
         f"📝 *Тип:* {broadcast.broadcast_type.value}\n"
-        f"🔄 *Периодичность:* {schedule_text}\n"
         f"👥 *Аудитория:* {'Все пользователи' if broadcast.target_all else f'{len(broadcast.target_users)} пользователей'}\n"
         f"✅ *Доставлено:* {broadcast.sent_count}\n"
         f"❌ *Ошибок:* {broadcast.failed_count}\n"
@@ -2313,47 +2046,21 @@ async def view_broadcast(callback: CallbackQuery):
     if broadcast.sent_at:
         text += f"📅 *Отправлена:* {broadcast.sent_at.strftime('%d.%m.%Y %H:%M')}\n"
     
-    if broadcast.last_sent_at:
-        text += f"🔄 *Последняя отправка:* {broadcast.last_sent_at.strftime('%d.%m.%Y %H:%M')}\n"
-    
-    if broadcast.next_send_at and broadcast.schedule_type != BroadcastSchedule.ONCE:
-        text += f"⏰ *Следующая отправка:* {broadcast.next_send_at.strftime('%d.%m.%Y %H:%M')}\n"
-    
-    if broadcast.template:
-        text += f"📝 *Шаблон:* {broadcast.template.value}\n"
-    
     text += f"\n💬 *Сообщение:*\n{broadcast.message[:500]}"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_broadcast_{broadcast_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_broadcasts")]
+        ]
+    )
     
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_broadcast_actions_keyboard(broadcast_id)
+        reply_markup=keyboard
     )
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("send_broadcast_"))
-async def send_broadcast_now(callback: CallbackQuery):
-    broadcast_id = callback.data.split("_")[2]
-    broadcast = db.get_broadcast(broadcast_id)
-    
-    if not broadcast:
-        await callback.answer("Рассылка не найдена", show_alert=True)
-        return
-    
-    broadcast.status = BroadcastStatus.SCHEDULED
-    broadcast.next_send_at = datetime.now()
-    
-    await callback.message.edit_text(
-        f"✅ Рассылка \"{broadcast.name}\" запущена!",
-        reply_markup=get_admin_keyboard()
-    )
-    
-    asyncio.create_task(db.execute_broadcast(broadcast_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("edit_broadcast_"))
-async def edit_broadcast(callback: CallbackQuery):
-    await callback.answer("Функция в разработке", show_alert=True)
 
 @dp.callback_query(F.data.startswith("delete_broadcast_"))
 async def delete_broadcast(callback: CallbackQuery):
@@ -2366,31 +2073,536 @@ async def delete_broadcast(callback: CallbackQuery):
     
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("cancel_broadcast_"))
-async def cancel_broadcast(callback: CallbackQuery):
-    broadcast_id = callback.data.split("_")[2]
-    broadcast = db.get_broadcast(broadcast_id)
+@dp.message(F.text == "📝 Шаблоны рассылок")
+async def templates_menu(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
     
-    if broadcast:
-        broadcast.status = BroadcastStatus.CANCELLED
-        await callback.message.edit_text(f"❌ Рассылка \"{broadcast.name}\" отменена!")
+    await message.answer(
+        "📝 *Шаблоны рассылок*\n\n"
+        "Здесь вы можете создавать и использовать шаблоны для рассылок.\n\n"
+        "Шаблоны позволяют быстро создавать типовые рассылки.",
+        parse_mode="Markdown",
+        reply_markup=get_templates_keyboard()
+    )
+
+@dp.callback_query(F.data == "create_template")
+async def create_template_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_template_name)
+    await callback.message.answer(
+        "Введите название шаблона:",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_template_name)
+async def create_template_name(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(template_name=message.text)
+    await state.set_state(AdminStates.waiting_for_template_message)
+    await message.answer(
+        "Введите текст шаблона (можно использовать Markdown):\n\n"
+        "Доступные переменные:\n"
+        "• {name} - имя пользователя\n"
+        "• {username} - username пользователя\n"
+        "• {date} - текущая дата\n"
+        "• {time} - текущее время",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+
+@dp.message(AdminStates.waiting_for_template_message)
+async def create_template_message(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(template_message=message.text)
+    await state.set_state(AdminStates.waiting_for_template_type)
+    await message.answer(
+        "Выберите тип шаблона:",
+        reply_markup=get_broadcast_type_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("broadcast_type_"))
+async def create_template_type(callback: CallbackQuery, state: FSMContext):
+    broadcast_type_str = callback.data.split("_")[2]
+    
+    type_map = {
+        "text": BroadcastType.TEXT,
+        "photo": BroadcastType.PHOTO,
+        "video": BroadcastType.VIDEO,
+        "document": BroadcastType.DOCUMENT
+    }
+    
+    broadcast_type = type_map.get(broadcast_type_str, BroadcastType.TEXT)
+    await state.update_data(template_type=broadcast_type)
+    
+    if broadcast_type != BroadcastType.TEXT:
+        await state.set_state(AdminStates.waiting_for_template_media)
+        await callback.message.answer(
+            "Отправьте медиафайл для шаблона (фото, видео или документ):",
+            reply_markup=get_cancel_inline_keyboard()
+        )
+    else:
+        data = await state.get_data()
+        template = db.add_broadcast_template(
+            name=data['template_name'],
+            template_text=data['template_message'],
+            broadcast_type=broadcast_type
+        )
+        
+        await callback.message.answer(
+            f"✅ Шаблон \"{template.name}\" успешно создан!\n\n"
+            f"ID: {template.id}\n"
+            f"Тип: {template.broadcast_type.value}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.clear()
     
     await callback.answer()
+
+@dp.message(AdminStates.waiting_for_template_media)
+async def create_template_media(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        file_id = message.video.file_id
+    elif message.document:
+        file_id = message.document.file_id
+    else:
+        await message.answer(
+            "❌ Пожалуйста, отправьте фото, видео или документ.",
+            reply_markup=get_cancel_inline_keyboard()
+        )
+        return
+    
+    data = await state.get_data()
+    template = db.add_broadcast_template(
+        name=data['template_name'],
+        template_text=data['template_message'],
+        broadcast_type=data['template_type'],
+        media_file_id=file_id
+    )
+    
+    await message.answer(
+        f"✅ Шаблон \"{template.name}\" успешно создан!\n\n"
+        f"ID: {template.id}\n"
+        f"Тип: {template.broadcast_type.value}",
+        reply_markup=get_admin_keyboard()
+    )
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("template_"))
+async def view_template(callback: CallbackQuery):
+    template_id = callback.data.split("_")[1]
+    template = db.get_broadcast_template(template_id)
+    
+    if not template:
+        await callback.answer("Шаблон не найден", show_alert=True)
+        return
+    
+    text = (
+        f"📝 *Шаблон: {template.name}*\n\n"
+        f"📊 *Тип:* {template.broadcast_type.value}\n"
+        f"📅 *Создан:* {template.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"💬 *Текст:*\n{template.template_text[:500]}"
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Использовать", callback_data=f"use_template_{template_id}")],
+            [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_template_{template_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_templates")]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("use_template_"))
+async def use_template_from_menu(callback: CallbackQuery, state: FSMContext):
+    template_id = callback.data.split("_")[2]
+    template = db.get_broadcast_template(template_id)
+    
+    if template:
+        await state.update_data(broadcast_name=template.name)
+        await state.update_data(broadcast_message=template.template_text)
+        await state.update_data(broadcast_type=template.broadcast_type)
+        await state.update_data(broadcast_media=template.media_file_id)
+        
+        await state.set_state(AdminStates.waiting_for_broadcast_schedule)
+        await callback.message.answer(
+            f"✅ Шаблон \"{template.name}\" загружен!\n\n"
+            f"Теперь выберите время отправки:",
+            reply_markup=get_broadcast_schedule_keyboard()
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_template_"))
+async def delete_template(callback: CallbackQuery):
+    template_id = callback.data.split("_")[2]
+    template = db.get_broadcast_template(template_id)
+    
+    if template:
+        db.delete_broadcast_template(template_id)
+        await callback.message.edit_text(f"✅ Шаблон \"{template.name}\" удален!")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_templates")
+async def back_to_templates(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📝 *Шаблоны рассылок*\n\n"
+        "Здесь вы можете создавать и использовать шаблоны для рассылок.",
+        parse_mode="Markdown",
+        reply_markup=get_templates_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(F.text == "🔄 Регулярные рассылки")
+async def recurring_broadcasts_menu(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    await message.answer(
+        "🔄 *Регулярные рассылки*\n\n"
+        "Здесь вы можете настроить автоматические регулярные рассылки.\n\n"
+        "• Ежедневные - каждый день в указанное время\n"
+        "• Еженедельные - раз в неделю\n"
+        "• Ежемесячные - раз в месяц",
+        parse_mode="Markdown",
+        reply_markup=get_recurring_keyboard()
+    )
+
+@dp.callback_query(F.data == "create_recurring")
+async def create_recurring_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_recurring_name)
+    await callback.message.answer(
+        "Введите название регулярной рассылки:",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_recurring_name)
+async def create_recurring_name(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    await state.update_data(recurring_name=message.text)
+    await state.set_state(AdminStates.waiting_for_recurring_template)
+    
+    templates = db.get_all_templates()
+    if not templates:
+        await message.answer(
+            "❌ Нет доступных шаблонов. Сначала создайте шаблон рассылки.",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.clear()
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for template in templates:
+        builder.row(InlineKeyboardButton(
+            text=f"📝 {template.name}",
+            callback_data=f"select_recurring_template_{template.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
+    
+    await message.answer(
+        "Выберите шаблон для регулярной рассылки:",
+        reply_markup=builder.as_markup()
+    )
+
+@dp.callback_query(F.data.startswith("select_recurring_template_"))
+async def select_recurring_template(callback: CallbackQuery, state: FSMContext):
+    template_id = callback.data.split("_")[3]
+    template = db.get_broadcast_template(template_id)
+    
+    if template:
+        await state.update_data(recurring_template_id=template_id)
+        await state.set_state(AdminStates.waiting_for_recurring_type)
+        await callback.message.answer(
+            "Выберите периодичность рассылки:",
+            reply_markup=get_recurring_type_keyboard()
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("recurring_"))
+async def select_recurring_type(callback: CallbackQuery, state: FSMContext):
+    recurring_type_str = callback.data.split("_")[1]
+    
+    type_map = {
+        "daily": RecurringType.DAILY,
+        "weekly": RecurringType.WEEKLY,
+        "monthly": RecurringType.MONTHLY
+    }
+    
+    recurring_type = type_map.get(recurring_type_str, RecurringType.DAILY)
+    await state.update_data(recurring_type=recurring_type)
+    await state.set_state(AdminStates.waiting_for_recurring_time)
+    
+    await callback.message.answer(
+        "Введите время отправки в формате `HH:MM` (например: `15:30`):\n\n"
+        "Рассылка будет отправляться каждый день в указанное время.",
+        parse_mode="Markdown",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_recurring_time)
+async def create_recurring_time(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        time_parts = message.text.split(':')
+        hour = int(time_parts[0])
+        minute = int(time_parts[1])
+        
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError
+        
+        now = datetime.now()
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        
+        await state.update_data(recurring_next_run=next_run)
+        await state.set_state(AdminStates.waiting_for_recurring_target)
+        await message.answer(
+            "Выберите аудиторию для рассылки:",
+            reply_markup=get_broadcast_target_keyboard()
+        )
+    except (ValueError, IndexError):
+        await message.answer(
+            "❌ Неверный формат. Используйте `HH:MM` (например: `15:30`):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_inline_keyboard()
+        )
+
+@dp.callback_query(F.data == "broadcast_target_all")
+async def recurring_target_all(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    
+    recurring = db.add_recurring_broadcast(
+        name=data['recurring_name'],
+        template_id=data['recurring_template_id'],
+        recurring_type=data['recurring_type'],
+        next_run=data['recurring_next_run'],
+        target_all=True
+    )
+    
+    await callback.message.answer(
+        f"✅ Регулярная рассылка \"{recurring.name}\" создана!\n\n"
+        f"📅 *Периодичность:* {recurring.recurring_type.value}\n"
+        f"⏰ *Следующий запуск:* {recurring.next_run.strftime('%d.%m.%Y %H:%M')}\n"
+        f"👥 *Аудитория:* Все пользователи\n\n"
+        f"Рассылка будет автоматически отправляться по расписанию.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+    
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data == "broadcast_target_select")
+async def recurring_target_select(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "Введите ID пользователей через запятую (например: 123456789, 987654321):",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_recurring_target)
+async def process_recurring_target(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    try:
+        user_ids = [int(x.strip()) for x in message.text.split(',')]
+        data = await state.get_data()
+        
+        recurring = db.add_recurring_broadcast(
+            name=data['recurring_name'],
+            template_id=data['recurring_template_id'],
+            recurring_type=data['recurring_type'],
+            next_run=data['recurring_next_run'],
+            target_all=False,
+            target_users=user_ids
+        )
+        
+        await message.answer(
+            f"✅ Регулярная рассылка \"{recurring.name}\" создана!\n\n"
+            f"📅 *Периодичность:* {recurring.recurring_type.value}\n"
+            f"⏰ *Следующий запуск:* {recurring.next_run.strftime('%d.%m.%Y %H:%M')}\n"
+            f"👥 *Аудитория:* {len(user_ids)} пользователей\n\n"
+            f"Рассылка будет автоматически отправляться по расписанию.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат. Введите ID через запятую.",
+            reply_markup=get_cancel_inline_keyboard()
+        )
+
+@dp.callback_query(F.data.startswith("recurring_"))
+async def view_recurring(callback: CallbackQuery):
+    recurring_id = callback.data.split("_")[1]
+    recurring = db.get_recurring_broadcast(recurring_id)
+    
+    if not recurring:
+        await callback.answer("Регулярная рассылка не найдена", show_alert=True)
+        return
+    
+    template = db.get_broadcast_template(recurring.template_id)
+    template_name = template.name if template else "Неизвестный шаблон"
+    
+    status = "🟢 Активна" if recurring.is_active else "🔴 Отключена"
+    type_text = {
+        RecurringType.DAILY: "Ежедневно",
+        RecurringType.WEEKLY: "Еженедельно",
+        RecurringType.MONTHLY: "Ежемесячно"
+    }.get(recurring.recurring_type, "Неизвестно")
+    
+    text = (
+        f"🔄 *Регулярная рассылка: {recurring.name}*\n\n"
+        f"📊 *Статус:* {status}\n"
+        f"📝 *Шаблон:* {template_name}\n"
+        f"🕐 *Периодичность:* {type_text}\n"
+        f"⏰ *Следующий запуск:* {recurring.next_run.strftime('%d.%m.%Y %H:%M')}\n"
+    )
+    
+    if recurring.last_run:
+        text += f"📅 *Последний запуск:* {recurring.last_run.strftime('%d.%m.%Y %H:%M')}\n"
+    
+    text += f"👥 *Аудитория:* {'Все пользователи' if recurring.target_all else f'{len(recurring.target_users)} пользователей'}\n"
+    text += f"📅 *Создана:* {recurring.created_at.strftime('%d.%m.%Y %H:%M')}"
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏸️ Остановить" if recurring.is_active else "▶️ Запустить", 
+                                 callback_data=f"toggle_recurring_{recurring_id}")],
+            [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_recurring_{recurring_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_recurring")]
+        ]
+    )
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("toggle_recurring_"))
+async def toggle_recurring(callback: CallbackQuery):
+    recurring_id = callback.data.split("_")[2]
+    recurring = db.get_recurring_broadcast(recurring_id)
+    
+    if recurring:
+        recurring.is_active = not recurring.is_active
+        status = "запущена" if recurring.is_active else "остановлена"
+        await callback.message.edit_text(f"✅ Регулярная рассылка \"{recurring.name}\" {status}!")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_recurring_"))
+async def delete_recurring(callback: CallbackQuery):
+    recurring_id = callback.data.split("_")[2]
+    recurring = db.get_recurring_broadcast(recurring_id)
+    
+    if recurring:
+        db.delete_recurring_broadcast(recurring_id)
+        await callback.message.edit_text(f"✅ Регулярная рассылка \"{recurring.name}\" удалена!")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_recurring")
+async def back_to_recurring(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🔄 *Регулярные рассылки*\n\n"
+        "Здесь вы можете настроить автоматические регулярные рассылки.",
+        parse_mode="Markdown",
+        reply_markup=get_recurring_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(F.text == "📊 Статистика рассылок")
+async def broadcast_stats(message: Message):
+    if not is_admin(message.from_user.id) or is_group_chat(message):
+        return
+    
+    broadcasts = db.get_all_broadcasts()
+    total_sent = sum(b.sent_count for b in broadcasts)
+    total_failed = sum(b.failed_count for b in broadcasts)
+    templates_count = len(db.get_all_templates())
+    recurring_count = len(db.get_all_recurring_broadcasts())
+    
+    text = (
+        f"📊 *Статистика рассылок*\n\n"
+        f"📢 *Всего рассылок:* {len(broadcasts)}\n"
+        f"✅ *Доставлено сообщений:* {total_sent}\n"
+        f"❌ *Ошибок:* {total_failed}\n"
+        f"📈 *Успешность:* {(total_sent/(total_sent+total_failed)*100) if total_sent+total_failed > 0 else 0:.1f}%\n\n"
+        f"📝 *Шаблонов:* {templates_count}\n"
+        f"🔄 *Регулярных рассылок:* {recurring_count}\n\n"
+        f"📋 *По статусам:*\n"
+        f"  • Черновики: {len([b for b in broadcasts if b.status == BroadcastStatus.DRAFT])}\n"
+        f"  • Отправлены: {len([b for b in broadcasts if b.status == BroadcastStatus.SENT])}\n"
+        f"  • Запланированы: {len([b for b in broadcasts if b.status == BroadcastStatus.SCHEDULED])}\n"
+        f"  • Отменены: {len([b for b in broadcasts if b.status == BroadcastStatus.CANCELLED])}"
+    )
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_broadcast_keyboard())
 
 @dp.callback_query(F.data == "back_to_broadcasts")
 async def back_to_broadcasts(callback: CallbackQuery):
     await callback.message.edit_text(
-        "📋 *Список рассылок*\n\nВыберите рассылку для просмотра:",
-        parse_mode="Markdown",
-        reply_markup=get_broadcast_list_keyboard()
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_to_broadcasts_menu")
-async def back_to_broadcasts_menu(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.message.answer(
-        "📢 *Управление рассылками*",
+        "📢 *Управление рассылками*\n\n"
+        "Здесь вы можете создавать и управлять рассылками для пользователей.",
         parse_mode="Markdown",
         reply_markup=get_broadcast_keyboard()
     )
@@ -3910,7 +4122,7 @@ async def back_to_admin_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ==================== АДМИН-ПАНЕЛЬ (ОСТАЛЬНЫЕ ФУНКЦИИ) ====================
+# ==================== АДМИН-ПАНЕЛЬ ====================
 
 @dp.message(F.text == "⚙️ Админ панель")
 async def admin_panel(message: Message):
@@ -4125,8 +4337,6 @@ async def back_to_reviews_admin(callback: CallbackQuery):
     await callback.message.delete()
     await manage_reviews(callback.message)
     await callback.answer()
-
-# ===== Управление товарами (админ) =====
 
 @dp.message(F.text == "➕ Добавить товар")
 async def add_product_start(message: Message, state: FSMContext):
@@ -4695,6 +4905,8 @@ async def show_statistics(message: Message):
         f"  • Участников: {stats['total_participants']}\n\n"
         f"📢 *Рассылки:*\n"
         f"  • Всего: {stats['total_broadcasts']}\n"
+        f"  • Шаблонов: {stats['total_templates']}\n"
+        f"  • Регулярных: {stats['total_recurring']}\n"
         f"  • Сообщений отправлено: {stats['total_messages_sent']}"
     )
     
@@ -5163,20 +5375,7 @@ async def view_screenshot(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ==================== СОЗДАНИЕ КОНКУРСОВ (АДМИН) ====================
-
-class ContestCreationState:
-    def __init__(self):
-        self.name = None
-        self.description = None
-        self.prizes = []
-        self.days = 7
-        self.winners_count = 1
-        self.max_participants = 0
-        self.required_products = []
-        self.min_purchase_amount = 0.0
-        self.current_prize_type = None
-        self.current_prize_value = None
+# ==================== УПРАВЛЕНИЕ КОНКУРСАМИ (АДМИН) ====================
 
 @dp.callback_query(F.data == "create_contest")
 async def create_contest_start(callback: CallbackQuery, state: FSMContext):
@@ -5185,8 +5384,6 @@ async def create_contest_start(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.set_state(AdminStates.waiting_for_contest_name)
-    await state.update_data(contest_creation=ContestCreationState())
-    
     await callback.message.answer(
         "Введите название конкурса:",
         reply_markup=get_cancel_inline_keyboard()
@@ -5203,11 +5400,7 @@ async def create_contest_name(message: Message, state: FSMContext):
         )
         return
     
-    data = await state.get_data()
-    creation = data.get('contest_creation')
-    creation.name = message.text
-    await state.update_data(contest_creation=creation)
-    
+    await state.update_data(contest_name=message.text)
     await state.set_state(AdminStates.waiting_for_contest_description)
     await message.answer(
         "Введите описание конкурса:",
@@ -5224,11 +5417,7 @@ async def create_contest_description(message: Message, state: FSMContext):
         )
         return
     
-    data = await state.get_data()
-    creation = data.get('contest_creation')
-    creation.description = message.text
-    await state.update_data(contest_creation=creation)
-    
+    await state.update_data(contest_description=message.text)
     await state.set_state(AdminStates.waiting_for_contest_prize_type)
     await message.answer(
         "🎁 *Добавление призов*\n\n"
@@ -5236,6 +5425,19 @@ async def create_contest_description(message: Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=get_prize_type_keyboard()
     )
+
+# Создаем класс для хранения временных данных конкурса
+class ContestTempData:
+    def __init__(self):
+        self.name = None
+        self.description = None
+        self.prizes = []
+        self.days = 7
+        self.winners_count = 1
+        self.max_participants = 0
+        self.required_products = []
+        self.min_purchase_amount = 0.0
+        self.current_prize_type = None
 
 @dp.callback_query(F.data.startswith("prize_type_"))
 async def add_prize_type(callback: CallbackQuery, state: FSMContext):
@@ -5257,10 +5459,13 @@ async def add_prize_type(callback: CallbackQuery, state: FSMContext):
         return
     
     data = await state.get_data()
-    creation = data.get('contest_creation')
-    creation.current_prize_type = prize_type
+    if 'contest_temp' not in data:
+        data['contest_temp'] = ContestTempData()
     
-    await state.update_data(contest_creation=creation)
+    contest_temp = data['contest_temp']
+    contest_temp.current_prize_type = prize_type
+    
+    await state.update_data(contest_temp=contest_temp)
     
     if prize_type == PrizeType.DISCOUNT_PROMOCODE:
         await state.set_state(AdminStates.waiting_for_contest_prize_value)
@@ -5300,22 +5505,10 @@ async def add_prize_type(callback: CallbackQuery, state: FSMContext):
             f"Введите сумму приза в {unit}:",
             reply_markup=get_cancel_inline_keyboard()
         )
-    elif prize_type == PrizeType.CUSTOM_PRIZE:
+    else:
         await state.set_state(AdminStates.waiting_for_contest_prize_description)
         await callback.message.answer(
-            "Введите описание индивидуального приза:",
-            reply_markup=get_cancel_inline_keyboard()
-        )
-    elif prize_type == PrizeType.COUPON:
-        await state.set_state(AdminStates.waiting_for_contest_prize_value)
-        await callback.message.answer(
-            "Введите описание купона:",
-            reply_markup=get_cancel_inline_keyboard()
-        )
-    elif prize_type == PrizeType.MYSTERY_BOX:
-        await state.set_state(AdminStates.waiting_for_contest_prize_description)
-        await callback.message.answer(
-            "Введите описание секретного приза:",
+            "Введите описание приза:",
             reply_markup=get_cancel_inline_keyboard()
         )
     
@@ -5326,20 +5519,21 @@ async def select_product_prize(callback: CallbackQuery, state: FSMContext):
     product_id = callback.data.split("_")[3]
     
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
     
-    prize = Prize(PrizeType.FREE_PRODUCT, product_id, None)
-    creation.prizes.append(prize)
-    creation.current_prize_type = None
-    
-    await state.update_data(contest_creation=creation)
-    
-    await callback.message.answer(
-        f"✅ Приз добавлен!\n\n"
-        f"Текущие призы: {len(creation.prizes)}\n\n"
-        f"Выберите следующий тип приза или завершите добавление:",
-        reply_markup=get_prize_type_keyboard()
-    )
+    if contest_temp:
+        prize = Prize(PrizeType.FREE_PRODUCT, product_id, None)
+        contest_temp.prizes.append(prize)
+        contest_temp.current_prize_type = None
+        
+        await state.update_data(contest_temp=contest_temp)
+        
+        await callback.message.answer(
+            f"✅ Приз добавлен!\n\n"
+            f"Текущие призы: {len(contest_temp.prizes)}\n\n"
+            f"Выберите следующий тип приза или завершите добавление:",
+            reply_markup=get_prize_type_keyboard()
+        )
     await callback.answer()
 
 @dp.message(AdminStates.waiting_for_contest_prize_value)
@@ -5353,29 +5547,34 @@ async def create_contest_prize_value(message: Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
+    
+    if not contest_temp:
+        await message.answer("❌ Ошибка создания конкурса")
+        await state.clear()
+        return
     
     try:
-        if creation.current_prize_type == PrizeType.DISCOUNT_PROMOCODE:
+        if contest_temp.current_prize_type == PrizeType.DISCOUNT_PROMOCODE:
             value = int(message.text)
             if value < 1 or value > 100:
                 raise ValueError
-        elif creation.current_prize_type in [PrizeType.CASH_REWARD, PrizeType.STARS_REWARD]:
+        elif contest_temp.current_prize_type in [PrizeType.CASH_REWARD, PrizeType.STARS_REWARD]:
             value = float(message.text.replace(',', '.'))
             if value <= 0:
                 raise ValueError
         else:
             value = message.text
         
-        prize = Prize(creation.current_prize_type, value, None)
-        creation.prizes.append(prize)
-        creation.current_prize_type = None
+        prize = Prize(contest_temp.current_prize_type, value, None)
+        contest_temp.prizes.append(prize)
+        contest_temp.current_prize_type = None
         
-        await state.update_data(contest_creation=creation)
+        await state.update_data(contest_temp=contest_temp)
         
         await message.answer(
             f"✅ Приз добавлен!\n\n"
-            f"Текущие призы: {len(creation.prizes)}\n\n"
+            f"Текущие призы: {len(contest_temp.prizes)}\n\n"
             f"Выберите следующий тип приза или завершите добавление:",
             reply_markup=get_prize_type_keyboard()
         )
@@ -5396,17 +5595,22 @@ async def create_contest_prize_description(message: Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
     
-    prize = Prize(creation.current_prize_type, message.text, message.text)
-    creation.prizes.append(prize)
-    creation.current_prize_type = None
+    if not contest_temp:
+        await message.answer("❌ Ошибка создания конкурса")
+        await state.clear()
+        return
     
-    await state.update_data(contest_creation=creation)
+    prize = Prize(contest_temp.current_prize_type, message.text, message.text)
+    contest_temp.prizes.append(prize)
+    contest_temp.current_prize_type = None
+    
+    await state.update_data(contest_temp=contest_temp)
     
     await message.answer(
         f"✅ Приз добавлен!\n\n"
-        f"Текущие призы: {len(creation.prizes)}\n\n"
+        f"Текущие призы: {len(contest_temp.prizes)}\n\n"
         f"Выберите следующий тип приза или завершите добавление:",
         reply_markup=get_prize_type_keyboard()
     )
@@ -5414,9 +5618,9 @@ async def create_contest_prize_description(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "prize_done")
 async def finish_adding_prizes(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
     
-    if not creation.prizes:
+    if not contest_temp or not contest_temp.prizes:
         await callback.answer("Добавьте хотя бы один приз!", show_alert=True)
         return
     
@@ -5464,9 +5668,10 @@ async def create_contest_days(message: Message, state: FSMContext):
             raise ValueError
         
         data = await state.get_data()
-        creation = data.get('contest_creation')
-        creation.days = days
-        await state.update_data(contest_creation=creation)
+        contest_temp = data.get('contest_temp')
+        if contest_temp:
+            contest_temp.days = days
+            await state.update_data(contest_temp=contest_temp)
         
         await state.set_state(AdminStates.waiting_for_contest_winners_count)
         await message.answer(
@@ -5516,9 +5721,10 @@ async def create_contest_winners_count(message: Message, state: FSMContext):
             raise ValueError
         
         data = await state.get_data()
-        creation = data.get('contest_creation')
-        creation.winners_count = winners_count
-        await state.update_data(contest_creation=creation)
+        contest_temp = data.get('contest_temp')
+        if contest_temp:
+            contest_temp.winners_count = winners_count
+            await state.update_data(contest_temp=contest_temp)
         
         await state.set_state(AdminStates.waiting_for_contest_max_participants)
         await message.answer(
@@ -5586,9 +5792,10 @@ async def create_contest_max_participants(message: Message, state: FSMContext):
             raise ValueError
         
         data = await state.get_data()
-        creation = data.get('contest_creation')
-        creation.max_participants = max_participants
-        await state.update_data(contest_creation=creation)
+        contest_temp = data.get('contest_temp')
+        if contest_temp:
+            contest_temp.max_participants = max_participants
+            await state.update_data(contest_temp=contest_temp)
         
         await state.set_state(AdminStates.waiting_for_contest_required_products)
         
@@ -5630,21 +5837,22 @@ async def add_required_product(callback: CallbackQuery, state: FSMContext):
     product_id = callback.data.split("_")[3]
     
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
     
-    if product_id not in creation.required_products:
-        creation.required_products.append(product_id)
-        await state.update_data(contest_creation=creation)
-        
-        product = db.get_product(product_id)
-        await callback.answer(f"✅ {product.name} добавлен в обязательные товары")
-    else:
-        await callback.answer("Этот товар уже добавлен")
+    if contest_temp:
+        if product_id not in contest_temp.required_products:
+            contest_temp.required_products.append(product_id)
+            await state.update_data(contest_temp=contest_temp)
+            
+            product = db.get_product(product_id)
+            await callback.answer(f"✅ {product.name} добавлен в обязательные товары")
+        else:
+            await callback.answer("Этот товар уже добавлен")
     
     products = db.get_all_products()
     builder = InlineKeyboardBuilder()
     for product in products:
-        status = "✅ " if product.id in creation.required_products else "📦 "
+        status = "✅ " if contest_temp and product.id in contest_temp.required_products else "📦 "
         builder.row(InlineKeyboardButton(
             text=f"{status}{product.name} - {format_price(product.price_rub)}₽",
             callback_data=f"add_required_product_{product.id}"
@@ -5688,40 +5896,36 @@ async def no_required_products(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "skip_min_amount_contest")
 async def skip_min_amount_contest(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    creation = data.get('contest_creation')
+    contest_temp = data.get('contest_temp')
+    
+    if not contest_temp:
+        await callback.answer("Ошибка создания конкурса", show_alert=True)
+        return
     
     contest = db.add_contest(
-        name=creation.name,
-        description=creation.description,
-        prizes=creation.prizes,
-        required_products=creation.required_products,
-        min_purchase_amount=creation.min_purchase_amount,
-        max_participants=creation.max_participants,
-        days_valid=creation.days,
-        winners_count=creation.winners_count
+        name=contest_temp.name,
+        description=contest_temp.description,
+        prizes=contest_temp.prizes,
+        required_products=contest_temp.required_products,
+        min_purchase_amount=contest_temp.min_purchase_amount,
+        max_participants=contest_temp.max_participants,
+        days_valid=contest_temp.days,
+        winners_count=contest_temp.winners_count
     )
     
     contest.status = ContestStatus.ACTIVE
     
-    broadcast_message = db.send_contest_broadcast(contest)
+    # Отправляем авто-рассылку о новом конкурсе
+    broadcast_message = db.get_contest_broadcast_message(contest)
     
     broadcast = db.add_broadcast(
         name=f"Новый конкурс: {contest.name}",
         message=broadcast_message,
         broadcast_type=BroadcastType.TEXT,
-        target_all=True,
-        schedule_type=BroadcastSchedule.ONCE,
-        template=BroadcastTemplate.NEW_CONTEST,
-        template_data={
-            'contest_name': contest.name,
-            'contest_description': contest.description,
-            'contest_prizes': '\n'.join([p.description for p in contest.prizes]),
-            'contest_end_date': contest.end_date.strftime('%d.%m.%Y %H:%M'),
-            'contest_link': f"https://t.me/{db.get_bot_username()}?start={contest.get_invite_link()}"
-        }
+        target_all=True
     )
     broadcast.status = BroadcastStatus.SCHEDULED
-    broadcast.next_send_at = datetime.now()
+    broadcast.scheduled_time = datetime.now()
     asyncio.create_task(db.execute_broadcast(broadcast.id))
     
     await callback.message.edit_text(
@@ -5732,7 +5936,7 @@ async def skip_min_amount_contest(callback: CallbackQuery, state: FSMContext):
         f"🎲 Победителей: {contest.winners_count}\n"
         f"📦 Обязательные товары: {len(contest.required_products)}\n"
         f"💰 Мин. сумма покупки: {format_price(contest.min_purchase_amount) if contest.min_purchase_amount > 0 else 'Без ограничений'}₽\n"
-        f"📅 Длительность: {creation.days} дней\n\n"
+        f"📅 Длительность: {contest_temp.days} дней\n\n"
         f"📢 *Автоматическая рассылка о конкурсе отправлена всем пользователям!*\n\n"
         f"Конкурс доступен для участия!",
         parse_mode="Markdown",
@@ -5758,42 +5962,40 @@ async def create_contest_min_amount(message: Message, state: FSMContext):
             raise ValueError
         
         data = await state.get_data()
-        creation = data.get('contest_creation')
-        creation.min_purchase_amount = min_amount
-        await state.update_data(contest_creation=creation)
+        contest_temp = data.get('contest_temp')
+        
+        if not contest_temp:
+            await message.answer("❌ Ошибка создания конкурса")
+            await state.clear()
+            return
+        
+        contest_temp.min_purchase_amount = min_amount
+        await state.update_data(contest_temp=contest_temp)
         
         contest = db.add_contest(
-            name=creation.name,
-            description=creation.description,
-            prizes=creation.prizes,
-            required_products=creation.required_products,
+            name=contest_temp.name,
+            description=contest_temp.description,
+            prizes=contest_temp.prizes,
+            required_products=contest_temp.required_products,
             min_purchase_amount=min_amount,
-            max_participants=creation.max_participants,
-            days_valid=creation.days,
-            winners_count=creation.winners_count
+            max_participants=contest_temp.max_participants,
+            days_valid=contest_temp.days,
+            winners_count=contest_temp.winners_count
         )
         
         contest.status = ContestStatus.ACTIVE
         
-        broadcast_message = db.send_contest_broadcast(contest)
+        # Отправляем авто-рассылку о новом конкурсе
+        broadcast_message = db.get_contest_broadcast_message(contest)
         
         broadcast = db.add_broadcast(
             name=f"Новый конкурс: {contest.name}",
             message=broadcast_message,
             broadcast_type=BroadcastType.TEXT,
-            target_all=True,
-            schedule_type=BroadcastSchedule.ONCE,
-            template=BroadcastTemplate.NEW_CONTEST,
-            template_data={
-                'contest_name': contest.name,
-                'contest_description': contest.description,
-                'contest_prizes': '\n'.join([p.description for p in contest.prizes]),
-                'contest_end_date': contest.end_date.strftime('%d.%m.%Y %H:%M'),
-                'contest_link': f"https://t.me/{db.get_bot_username()}?start={contest.get_invite_link()}"
-            }
+            target_all=True
         )
         broadcast.status = BroadcastStatus.SCHEDULED
-        broadcast.next_send_at = datetime.now()
+        broadcast.scheduled_time = datetime.now()
         asyncio.create_task(db.execute_broadcast(broadcast.id))
         
         await message.answer(
@@ -5804,7 +6006,7 @@ async def create_contest_min_amount(message: Message, state: FSMContext):
             f"🎲 Победителей: {contest.winners_count}\n"
             f"📦 Обязательные товары: {len(contest.required_products)}\n"
             f"💰 Мин. сумма покупки: {format_price(min_amount) if min_amount > 0 else 'Без ограничений'}₽\n"
-            f"📅 Длительность: {creation.days} дней\n\n"
+            f"📅 Длительность: {contest_temp.days} дней\n\n"
             f"📢 *Автоматическая рассылка о конкурсе отправлена всем пользователям!*\n\n"
             f"Конкурс доступен для участия!",
             parse_mode="Markdown",
@@ -5817,8 +6019,6 @@ async def create_contest_min_amount(message: Message, state: FSMContext):
             "❌ Введите корректное число",
             reply_markup=get_cancel_inline_keyboard()
         )
-
-# ==================== УПРАВЛЕНИЕ КОНКУРСАМИ (АДМИН) ====================
 
 @dp.callback_query(F.data.startswith("admin_contest_"))
 async def admin_view_contest(callback: CallbackQuery):
@@ -5876,8 +6076,7 @@ async def admin_view_contest(callback: CallbackQuery):
     if contest.min_purchase_amount > 0:
         text += f"\n💰 *Мин. сумма покупки:* {format_price(contest.min_purchase_amount)}₽"
     
-    bot_username = db.get_bot_username()
-    invite_link = f"https://t.me/{bot_username}?start={contest.get_invite_link()}"
+    invite_link = contest.get_invite_link(db.get_bot_username())
     text += f"\n\n🔗 *Ссылка для участия:*\n`{invite_link}`"
     
     if contest.winners:
@@ -5925,8 +6124,7 @@ async def copy_contest_link(callback: CallbackQuery):
     contest = db.get_contest(contest_id)
     
     if contest:
-        bot_username = db.get_bot_username()
-        invite_link = f"https://t.me/{bot_username}?start={contest.get_invite_link()}"
+        invite_link = contest.get_invite_link(db.get_bot_username())
         
         await callback.message.answer(
             f"🔗 *Ссылка для участия в конкурсе \"{contest.name}\":*\n\n"
@@ -5948,25 +6146,17 @@ async def activate_contest(callback: CallbackQuery):
     if contest:
         contest.status = ContestStatus.ACTIVE
         
-        broadcast_message = db.send_contest_broadcast(contest)
+        # Отправляем авто-рассылка о новом конкурсе
+        broadcast_message = db.get_contest_broadcast_message(contest)
         
         broadcast = db.add_broadcast(
             name=f"Новый конкурс: {contest.name}",
             message=broadcast_message,
             broadcast_type=BroadcastType.TEXT,
-            target_all=True,
-            schedule_type=BroadcastSchedule.ONCE,
-            template=BroadcastTemplate.NEW_CONTEST,
-            template_data={
-                'contest_name': contest.name,
-                'contest_description': contest.description,
-                'contest_prizes': '\n'.join([p.description for p in contest.prizes]),
-                'contest_end_date': contest.end_date.strftime('%d.%m.%Y %H:%M'),
-                'contest_link': f"https://t.me/{db.get_bot_username()}?start={contest.get_invite_link()}"
-            }
+            target_all=True
         )
         broadcast.status = BroadcastStatus.SCHEDULED
-        broadcast.next_send_at = datetime.now()
+        broadcast.scheduled_time = datetime.now()
         asyncio.create_task(db.execute_broadcast(broadcast.id))
         
         await callback.message.edit_text(
@@ -6029,6 +6219,7 @@ async def select_winners(callback: CallbackQuery):
             logger.error(f"Failed to notify winner {winner_id}: {e}")
             text += f"• Пользователь ID:{winner_id} - {prize.description} (не удалось уведомить)\n"
     
+    # Отправляем уведомление всем участникам
     for participant in contest.participants:
         if participant not in [w[0] for w in winners]:
             try:
@@ -6062,10 +6253,6 @@ async def delete_contest(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_contests_admin")
 async def back_to_contests_admin(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    
     await callback.message.edit_text(
         "🎁 *Управление конкурсами*\n\n"
         "Выберите действие:",
@@ -6076,11 +6263,46 @@ async def back_to_contests_admin(callback: CallbackQuery):
 
 # ==================== ЗАПУСК БОТА ====================
 
+async def check_recurring_broadcasts():
+    """Фоновая задача для проверки и отправки регулярных рассылок"""
+    while True:
+        try:
+            now = datetime.now()
+            recurring_list = db.get_all_recurring_broadcasts()
+            
+            for recurring in recurring_list:
+                if recurring.is_active and recurring.next_run <= now:
+                    template = db.get_broadcast_template(recurring.template_id)
+                    
+                    if template:
+                        # Создаем и отправляем рассылку
+                        broadcast = db.add_broadcast(
+                            name=f"Регулярная: {recurring.name} - {now.strftime('%d.%m.%Y %H:%M')}",
+                            message=template.template_text,
+                            broadcast_type=template.broadcast_type,
+                            media_file_id=template.media_file_id,
+                            scheduled_time=now,
+                            target_all=recurring.target_all,
+                            target_users=recurring.target_users,
+                            recurring_id=recurring.id
+                        )
+                        broadcast.status = BroadcastStatus.SCHEDULED
+                        asyncio.create_task(db.execute_broadcast(broadcast.id))
+                        
+                        # Обновляем время следующего запуска
+                        db.update_recurring_next_run(recurring.id)
+            
+            await asyncio.sleep(60)  # Проверяем каждую минуту
+        except Exception as e:
+            logger.error(f"Error in recurring broadcasts checker: {e}")
+            await asyncio.sleep(60)
+
 async def on_startup():
     logger.info("Бот запущен!")
     
     db.set_bot_instance(bot)
     
+    # Добавляем тестовые товары
     db.add_product(
         "Тестовый товар 1",
         "Описание тестового товара 1",
@@ -6103,9 +6325,21 @@ async def on_startup():
         200
     )
     
+    # Добавляем тестовые промокоды
     db.add_promocode("TEST10", 10, 30, 100)
     db.add_promocode("SALE20", 20, 14, 50, 500)
     
+    # Добавляем тестовые шаблоны
+    db.add_broadcast_template(
+        name="Приветственный",
+        template_text="👋 Добро пожаловать в наш магазин!\n\nРады видеть вас среди наших покупателей!"
+    )
+    db.add_broadcast_template(
+        name="Новости магазина",
+        template_text="📢 *Новости магазина*\n\nУ нас новые поступления!\n\n{name}, приходите посмотреть!"
+    )
+    
+    # Добавляем тестовый конкурс
     prizes = [
         Prize(PrizeType.DISCOUNT_PROMOCODE, 50, "Промокод на скидку 50%"),
         Prize(PrizeType.CASH_REWARD, 1000, "Денежный приз 1000₽"),
@@ -6127,6 +6361,9 @@ async def on_startup():
     bot_info = await bot.get_me()
     db.set_bot_username(bot_info.username or "ShopBot")
     
+    # Запускаем фоновую задачу для регулярных рассылок
+    asyncio.create_task(check_recurring_broadcasts())
+    
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -6136,10 +6373,10 @@ async def on_startup():
                 "• 🎁 Система конкурсов с различными типами призов\n"
                 "• 🔗 Ссылки для приглашения в конкурсы\n"
                 "• 📢 Автоматические рассылки при создании конкурса\n"
-                "• 📨 Готовые шаблоны рассылок (8 типов)\n"
-                "• 🔄 Регулярные рассылки (ежедневно, еженедельно, ежемесячно)\n"
-                "• ⏰ Запланированные рассылки\n"
-                "• 📊 Статистика рассылок\n"
+                "• 📝 Шаблоны рассылок для быстрого создания\n"
+                "• 🔄 Регулярные рассылки (ежедневные/еженедельные)\n"
+                "• ⏰ Запланированные разовые рассылки\n"
+                "• 📊 Полная статистика рассылок\n"
                 "• 🎫 Промокоды с минимальной суммой заказа\n"
                 "• 👥 Максимальное количество участников в конкурсе\n"
                 "• 🎲 Автоматический выбор победителей\n\n"
@@ -6151,10 +6388,12 @@ async def on_startup():
                 "  • 🎨 Индивидуальный приз\n"
                 "  • 🎟️ Купон\n"
                 "  • 📦 Секретный приз\n\n"
-                "📢 *Типы рассылок:*\n"
-                "  • Обычные рассылки (текст, фото, видео)\n"
-                "  • Регулярные (ежедневно, еженедельно, ежемесячно)\n"
-                "  • Готовые шаблоны (новый товар, конкурс, промокод, распродажа, праздничная, напоминание, благодарность, опрос)\n"
+                "📢 *Рассылки:*\n"
+                "  • Создание текстовых и медиа-рассылок\n"
+                "  • Шаблоны для быстрого создания\n"
+                "  • Регулярные рассылки по расписанию\n"
+                "  • Запланированные разовые рассылки\n"
+                "  • Выборочная аудитория\n"
                 "  • Автоматические рассылки о конкурсах\n\n"
                 "Чтобы настроить группу для отзывов:\n"
                 "1. Добавьте бота в группу как администратора\n"
