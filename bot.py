@@ -123,8 +123,7 @@ class Prize:
         if self.type == PrizeType.DISCOUNT_PROMOCODE:
             return f"Промокод на скидку {self.value}%"
         elif self.type == PrizeType.FREE_PRODUCT:
-            product = db.get_product(self.value) if hasattr(db, 'get_product') else None
-            return f"Бесплатный товар: {product.name if product else 'Неизвестный'}"
+            return f"Бесплатный товар"
         elif self.type == PrizeType.CASH_REWARD:
             return f"Денежный приз {self.value}₽"
         elif self.type == PrizeType.STARS_REWARD:
@@ -858,9 +857,6 @@ class Database:
         users = self.get_all_users() if broadcast.target_all else broadcast.target_users
         
         for user_id in users:
-            if user_id in ADMIN_IDS:
-                continue
-            
             try:
                 if broadcast.broadcast_type == BroadcastType.TEXT:
                     await self.bot_instance.send_message(user_id, broadcast.message, parse_mode="Markdown")
@@ -1407,6 +1403,12 @@ def get_cancel_inline_keyboard():
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
     return builder.as_markup()
 
+def get_contest_share_keyboard(contest_id: str):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_contest_{contest_id}"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"contest_{contest_id}"))
+    return builder.as_markup()
+
 # ==================== ОСНОВНЫЕ ОБРАБОТЧИКИ ====================
 
 @dp.message(CommandStart())
@@ -1417,7 +1419,6 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     args = message.text.split()
     
-    # Обработка ссылки на конкурс
     if len(args) > 1:
         payload = args[1]
         if payload.startswith("contest_"):
@@ -1570,14 +1571,14 @@ async def view_contest(callback: CallbackQuery):
         contest_text += f"\n\n✅ *Вы уже участвуете в конкурсе!*"
     
     invite_link = contest.get_invite_link(db.get_bot_username())
-    contest_text += f"\n\n🔗 *Поделитесь ссылкой с друзьями:*\n`{invite_link}`"
+    contest_text += f"\n\n🔗 *Ссылка для участия:*\n`{invite_link}`"
     
     keyboard = InlineKeyboardBuilder()
     
     if passed and not has_participated:
         keyboard.row(InlineKeyboardButton(text="🎲 Участвовать", callback_data=f"participate_{contest_id}"))
     
-    keyboard.row(InlineKeyboardButton(text="📤 Поделиться ссылкой", callback_data=f"share_contest_{contest_id}"))
+    keyboard.row(InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_contest_{contest_id}"))
     keyboard.row(InlineKeyboardButton(text="◀️ Назад к конкурсам", callback_data="back_to_contests"))
     
     try:
@@ -1676,7 +1677,6 @@ async def manage_contests(message: Message):
         reply_markup=get_admin_contests_inline_keyboard()
     )
 
-# Класс для временного хранения данных конкурса
 class ContestCreationData:
     def __init__(self):
         self.name = ""
@@ -1688,7 +1688,6 @@ class ContestCreationData:
         self.required_products = []
         self.min_purchase_amount = 0.0
         self.current_prize_type = None
-        self.current_prize_value = None
 
 @dp.callback_query(F.data == "create_contest")
 async def create_contest_start(callback: CallbackQuery, state: FSMContext):
@@ -2220,11 +2219,8 @@ async def skip_min_amount_contest(callback: CallbackQuery, state: FSMContext):
     )
     
     contest.status = ContestStatus.ACTIVE
-    
-    # Создаем ссылку для конкурса
     contest.invite_link = f"contest_{contest.id}"
     
-    # Отправляем авто-рассылку о новом конкурсе
     broadcast_message = db.get_contest_broadcast_message(contest)
     broadcast = db.add_broadcast(
         name=f"Новый конкурс: {contest.name}",
@@ -2246,7 +2242,7 @@ async def skip_min_amount_contest(callback: CallbackQuery, state: FSMContext):
         f"💰 Мин. сумма покупки: {format_price(contest.min_purchase_amount) if contest.min_purchase_amount > 0 else 'Без ограничений'}₽\n"
         f"📅 Длительность: {creation.days} дней\n\n"
         f"🔗 *Ссылка для участия:*\n`{contest.get_invite_link(db.get_bot_username())}`\n\n"
-        f"📢 *Автоматическая рассылка о конкурсе отправлена пользователям!*\n\n"
+        f"📢 *Автоматическая рассылка о конкурсе отправлена всем пользователям!*\n\n"
         f"Конкурс доступен для участия!",
         parse_mode="Markdown",
         reply_markup=get_admin_keyboard()
@@ -2293,11 +2289,8 @@ async def create_contest_min_amount(message: Message, state: FSMContext):
         )
         
         contest.status = ContestStatus.ACTIVE
-        
-        # Создаем ссылку для конкурса
         contest.invite_link = f"contest_{contest.id}"
         
-        # Отправляем авто-рассылку о новом конкурсе
         broadcast_message = db.get_contest_broadcast_message(contest)
         broadcast = db.add_broadcast(
             name=f"Новый конкурс: {contest.name}",
@@ -2319,7 +2312,7 @@ async def create_contest_min_amount(message: Message, state: FSMContext):
             f"💰 Мин. сумма покупки: {format_price(min_amount) if min_amount > 0 else 'Без ограничений'}₽\n"
             f"📅 Длительность: {creation.days} дней\n\n"
             f"🔗 *Ссылка для участия:*\n`{contest.get_invite_link(db.get_bot_username())}`\n\n"
-            f"📢 *Автоматическая рассылка о конкурсе отправлена пользователям!*\n\n"
+            f"📢 *Автоматическая рассылка о конкурсе отправлена всем пользователям!*\n\n"
             f"Конкурс доступен для участия!",
             parse_mode="Markdown",
             reply_markup=get_admin_keyboard()
@@ -2458,7 +2451,6 @@ async def activate_contest(callback: CallbackQuery):
     if contest:
         contest.status = ContestStatus.ACTIVE
         
-        # Отправляем авто-рассылку о новом конкурсе
         broadcast_message = db.get_contest_broadcast_message(contest)
         broadcast = db.add_broadcast(
             name=f"Новый конкурс: {contest.name}",
@@ -2473,7 +2465,7 @@ async def activate_contest(callback: CallbackQuery):
         await callback.message.edit_text(
             f"✅ Конкурс \"{contest.name}\" активирован!\n\n"
             f"🔗 *Ссылка для участия:*\n`{contest.get_invite_link(db.get_bot_username())}`\n\n"
-            f"📢 Автоматическая рассылка отправлена пользователям!"
+            f"📢 Автоматическая рассылка отправлена всем пользователям!"
         )
     
     await callback.answer()
@@ -4365,7 +4357,7 @@ async def add_product_price_rub(message: Message, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_product_price_stars)
         await message.answer(
             "Введите цену в звездах (можно использовать дробные числа, например 9.99):",
-            reply_markup=get_cancel_inline_keyboard()
+        reply_markup=get_cancel_inline_keyboard()
         )
     except ValueError:
         await message.answer(
@@ -4391,7 +4383,7 @@ async def add_product_price_stars(message: Message, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_product_stock)
         await message.answer(
             "Введите количество на складе (целое число):",
-            reply_markup=get_cancel_inline_keyboard()
+        reply_markup=get_cancel_inline_keyboard()
         )
     except ValueError:
         await message.answer(
@@ -6277,7 +6269,6 @@ async def back_to_broadcasts(callback: CallbackQuery):
 # ==================== ЗАПУСК БОТА ====================
 
 async def check_recurring_broadcasts():
-    """Фоновая задача для проверки и отправки регулярных рассылок"""
     while True:
         try:
             now = datetime.now()
@@ -6313,7 +6304,6 @@ async def on_startup():
     
     db.set_bot_instance(bot)
     
-    # Добавляем тестовые товары
     db.add_product(
         "Тестовый товар 1",
         "Описание тестового товара 1",
@@ -6336,11 +6326,9 @@ async def on_startup():
         200
     )
     
-    # Добавляем тестовые промокоды
     db.add_promocode("TEST10", 10, 30, 100)
     db.add_promocode("SALE20", 20, 14, 50, 500)
     
-    # Добавляем тестовые шаблоны
     db.add_broadcast_template(
         name="Приветственный",
         template_text="👋 Добро пожаловать в наш магазин!\n\nРады видеть вас среди наших покупателей!"
@@ -6350,7 +6338,6 @@ async def on_startup():
         template_text="📢 *Новости магазина*\n\nУ нас новые поступления!\n\nПриходите посмотреть!"
     )
     
-    # Добавляем тестовый конкурс
     prizes = [
         Prize(PrizeType.DISCOUNT_PROMOCODE, 50, "Промокод на скидку 50%"),
         Prize(PrizeType.CASH_REWARD, 1000, "Денежный приз 1000₽"),
@@ -6386,17 +6373,15 @@ async def on_startup():
                 "• 📦 Отслеживание заказов\n"
                 "• ⭐ Отзывы о покупках\n"
                 "• 🎁 Конкурсы с различными типами призов\n"
-                "• 🔗 Ссылки для приглашения в конкурсы (работают через /start)\n"
+                "• 🔗 Ссылки для приглашения в конкурсы\n"
                 "• 📢 Рассылки (шаблоны, регулярные, авто-рассылки)\n"
                 "• 🎫 Промокоды с настройками\n"
                 "• 📊 Полная статистика\n\n"
+                "📌 *Рассылки отправляются ВСЕМ пользователям (включая администраторов)*\n\n"
                 "📌 *Как работают ссылки на конкурсы:*\n"
                 "• При создании конкурса генерируется ссылка вида:\n"
                 "  `https://t.me/{bot_username}?start=contest_ID`\n"
                 "• Пользователь переходит по ссылке и автоматически участвует\n\n"
-                "📌 *Администраторам:*\n"
-                "• Рассылки НЕ приходят администраторам\n"
-                "• Управление конкурсами - в разделе '🎁 Управление конкурсами'\n\n"
                 "Чтобы настроить группу для отзывов:\n"
                 "1. Добавьте бота в группу как администратора\n"
                 "2. Отправьте в группе команду /setreviewsgroup",
